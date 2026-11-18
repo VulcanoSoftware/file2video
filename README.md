@@ -1,69 +1,139 @@
 # file2video
 
-A Rust command-line tool that turns a file into an encrypted H.264 MP4 and restores the file byte for byte. The MP4 format is compatible in both directions with [Bit2Vid v1](https://github.com/nuan-cmyk/Bit2Vid). No Python or Rust installation is required to run a prebuilt binary.
+Command-line tool that turns any file into an encrypted H.264 MP4 video and restores it byte for byte. The video format is compatible in both directions with [Bit2Vid v1](https://github.com/nuan-cmyk/Bit2Vid).
+
+**How it works:** the file (and its name) is encrypted with AES-256-GCM, protected with Reed-Solomon error correction, drawn as black and white blocks on video frames, and encoded with x264. Decoding reverses the process and publishes the output only after the password and integrity checks pass.
+
+## Requirements
+
+- A prebuilt binary from [GitHub Releases](https://github.com/VulcanoSoftware/file2video/releases) (no Rust or Python needed).
+- [FFmpeg](https://ffmpeg.org/download.html) with `libx264`, plus `ffprobe`, on your `PATH`.
+
+| Platform | Install FFmpeg |
+| --- | --- |
+| Windows x64 | `winget install --id Gyan.FFmpeg -e`, then reopen your terminal |
+| Ubuntu / Debian | `sudo apt install ffmpeg` |
+| macOS | `brew install ffmpeg` |
+
+Check with `ffmpeg -version` and `ffprobe -version`. If FFmpeg is not on your `PATH`, pass `--ffmpeg /path/to/ffmpeg`; `ffprobe` is looked up next to it unless you set `--ffprobe`. FFmpeg versions before and after 5.1 are both supported.
 
 ## Install
 
-Download the archive for your OS and CPU from [GitHub Releases](https://github.com/vectrastack/file2video/releases) and extract it. Each successful build on `main` publishes a release with all five platform archives and their SHA-256 checksums. Pull request builds are only available as temporary [Actions artifacts](https://github.com/vectrastack/file2video/actions/workflows/ci.yml).
+Download the archive for your system from [Releases](https://github.com/VulcanoSoftware/file2video/releases), verify it against the `.sha256` file next to it, and extract it.
 
-Install [FFmpeg](https://ffmpeg.org/download.html) with `libx264` and `ffprobe` as well:
-
-| Platform | FFmpeg installation |
+| System | Archive |
 | --- | --- |
-| Windows x64 | `winget install --id Gyan.FFmpeg -e`, then reopen PowerShell |
-| Ubuntu / Debian | `sudo apt install ffmpeg` |
-| macOS (Intel or Apple Silicon) | `brew install ffmpeg` |
+| Windows x64 | `file2video-<version>-windows-x86_64.zip` |
+| Linux x64 / ARM64 | `file2video-<version>-linux-x86_64.tar.gz` / `-linux-aarch64.tar.gz` |
+| macOS Intel / Apple Silicon | `file2video-<version>-macos-x86_64.tar.gz` / `-macos-aarch64.tar.gz` |
 
-Check `ffmpeg -version` and `ffprobe -version` before running the CLI. If needed, supply `--ffmpeg /path/to/ffmpeg`; the tool looks for `ffprobe` next to that executable unless `--ffprobe` is set. GitHub builds Linux x64 on Ubuntu 22.04 and Linux ARM64 on Ubuntu 24.04; older systems may need to build from source.
+The Linux x64 build is made on Ubuntu 22.04 and the Linux ARM64 build on Ubuntu 24.04. On older distributions, [build from source](#build-from-source).
 
-## Use
+## Quick start
 
-In PowerShell, from the extracted directory:
+```sh
+./file2video estimate archive.zip                  # frames and duration, writes nothing
+./file2video encode archive.zip archive.mp4        # asks for a password (twice)
+mkdir recovered
+./file2video decode archive.mp4 recovered          # asks for the password, restores archive.zip
+```
+
+On Windows, use `.\file2video.exe` in PowerShell. To check the result:
 
 ```powershell
-.\file2video.exe estimate .\1GB.bin
-.\file2video.exe encode .\1GB.bin .\output.mp4
-.\file2video.exe decode .\output.mp4 .\restored.bin
-Get-FileHash .\1GB.bin, .\restored.bin
+Get-FileHash .\archive.zip, .\recovered\archive.zip
 ```
 
-On Linux or macOS:
+Decode the result once after encoding to confirm that the video works, especially when you use non-default settings.
+
+## Commands
+
+### `encode <INPUT> <OUTPUT>`
+
+Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--width`, `--height` | `1920`, `1080` | Video size. Even numbers, at most 8192 per side and 35.4 megapixels, divisible by the block size. |
+| `--block-size` | `8` | Pixels per bit. One of `8`, `10`, `12`, `16`, `20`. Larger blocks hold less data per frame, so the video gets longer. |
+| `--fps` | `30` | Frames per second (1–60). |
+| `--crf` | `18` | x264 quality (0–51, lower is better). |
+| `--preset` | `slow` | x264 preset, `ultrafast` to `veryslow`. |
+| `--ecc-symbols` | `64` | Reed-Solomon parity bytes per 255-byte codeword (1–127). |
+| `--compress` | off | Smaller-output profile: `light`, `medium` or `high`. |
+| `--pbkdf2-iterations` | `600000` | PBKDF2-HMAC-SHA256 iterations (1–10,000,000). |
+
+`--compress` sets CRF, preset and parity together: `light` = CRF 22 / `slow` / 64, `medium` = CRF 30 / `slower` / 32, `high` = CRF 38 / `veryslow` / 16. Explicit `--crf`, `--preset` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
+
+### `decode <INPUT> <OUTPUT>`
+
+Recovers the original file from the video. The resolution and block size are detected automatically.
+
+- If `OUTPUT` is an existing directory, the file is restored there under its original name.
+- If `OUTPUT` is a file path, the file is written to that name. With `--restore-name` the original name is used instead, in the directory that contains `OUTPUT`.
+- Existing files are never overwritten.
+- The result appears at its final path only after the AES-GCM tag and SHA-256 hash have been verified. On failure, the temporary file is removed.
+- A stored filename that is unsafe to restore (path separators, Windows device names, control characters and similar) is rejected; give an explicit output file name instead.
+
+| Option | Description |
+| --- | --- |
+| `--restore-name` | Use the stored filename, in the directory that contains `OUTPUT`. |
+| `--width`, `--height` | Override resolution detection (both required together). |
+| `--block-size` | Override block-size detection. |
+
+### `estimate <INPUT>`
+
+Prints the exact encrypted size, frame count and playback duration for a file, without writing any video. It accepts the same video options as `encode`. It cannot predict the MP4 file size or the encoding time.
+
+### Options for all commands
+
+| Option | Description |
+| --- | --- |
+| `--ffmpeg <PATH>` | FFmpeg executable (default: from `PATH`). |
+| `--ffprobe <PATH>` | ffprobe executable (default: next to FFmpeg, else `PATH`). |
+| `--threads <N>` | Thread limit for the Rust error-correction pool and for FFmpeg (`0` = automatic). |
+
+## Passwords
+
+`encode` asks for a password and a confirmation; `decode` asks once. For scripts, use `--password-file <FILE>`: a UTF-8 text file of at most 64 KiB, of which one trailing newline is ignored. `--password <TEXT>` also works but can leak through shell history and process lists. The two options cannot be combined, and an empty password is rejected.
+
+For Bit2Vid v1 compatibility, passwords can only contain Latin-1 characters (for example ASCII and `é`). Other characters are rejected.
+
+## Size, duration and disk space
+
+- **Capacity:** at the defaults one frame carries 4,050 bytes, of which about 3,030 are file data after error correction. That is roughly 91 KB per second of video, or about 3.3 hours of video per GiB. 1 MiB takes 346 frames (11.5 s).
+- **MP4 size:** random or compressed data hardly compresses in H.264, so the MP4 ends up several times larger than the input. For example, 1 MiB of random data produced a 7.6 MB MP4 at the defaults. Use `estimate` for the duration, not the file size.
+- **File size limit:** a single file must be just under 64 GiB (the AES-GCM limit of Bit2Vid v1).
+- **Disk space:** `encode` stages the ciphertext in a temporary file in the output directory, because Bit2Vid stores the authentication tag before the ciphertext. Budget about the input size for that, plus the MP4 itself. `decode` stages the restored file in the output directory before publishing it.
+- **Speed:** x264 at the default `slow` preset dominates encoding time. `--preset veryfast` is faster at the cost of a different size/quality trade-off; verify the result with a round trip. Error correction runs in parallel and uses AVX2 on x86-64 when available, with a portable fallback. No GPU is used.
+
+## Reliability and security
+
+- **Error correction:** Reed-Solomon (255 bytes per codeword) repairs up to half the parity count in corrupted bytes per codeword, which is 32 bytes at the default of 64. It repairs damaged pixels, not missing frames.
+- **The video is not a backup:** cropping, scaling, trimming, dropped frames or heavy re-encoding (for example by a video platform) can make recovery impossible. Keep the original file.
+- **Encryption:** AES-256-GCM with a key from PBKDF2-HMAC-SHA256 (600,000 iterations by default) and a random salt and nonce per file. The original filename is encrypted along with the data. A wrong password or a damaged video fails authentication, and no output is written.
+- **What is not hidden:** the video visibly shows black and white blocks, and its length reveals the approximate file size.
+
+## Build from source
+
+You need a recent stable Rust toolchain (the version used by CI is pinned in [`ci.yml`](.github/workflows/ci.yml)) and FFmpeg with `libx264` for the tests.
 
 ```sh
-./file2video estimate archive.zip
-./file2video encode archive.zip archive.mp4
-mkdir recovered
-./file2video decode archive.mp4 recovered
-```
-
-`encode` prompts for a password and asks you to confirm it; `decode` prompts once. Bit2Vid v1 passwords use Latin-1 for interoperability (for example, ASCII and `é`). To automate, use `--password-file` with a protected text file. `--password` exists for compatibility, but can expose the password in your history or a process listing.
-
-Decode detects the resolution and block size automatically. An existing output directory restores the stored name, and an explicit file path lets you choose the name. The output directory must already exist; existing files are never overwritten. Decode publishes an output only after verifying the AES-GCM tag and SHA-256, and deletes ordinary temporary outputs on failure.
-
-## Quality and performance
-
-The defaults are unchanged from Bit2Vid: 1920×1080, 30 FPS, 8-pixel blocks, x264 `slow` at CRF 18, 64 parity symbols per 255-byte Reed-Solomon codeword, and AES-256-GCM with PBKDF2-HMAC-SHA256 at 600,000 iterations. That ECC can repair up to 32 changed bytes per codeword, not 32 dropped frames. The video is not a substitute for the original backup: cropping, scaling, trimming, frame dropping or heavy transcoding may make recovery impossible.
-
-- Rust computes compatible parity in reusable parallel batches. It uses AVX2 when available, with a portable fallback. On clean decode, it checks parity before invoking the slower error-correction decoder.
-- Encode streams the compact bit grid to FFmpeg for integer nearest-neighbor expansion, rather than sending fully expanded frames. Rust keeps a bounded set of working buffers and uses temporary disk space for the ciphertext, because Bit2Vid places the authentication tag before the ciphertext. Budget for roughly the input file size in scratch space, in addition to the MP4, in the output directory. Decode stages the restored file there before publishing it.
-- The same CPU video encoder remains the default. No GPU is needed. Hardware encoders are not offered here because they do not reproduce the x264 quality/size trade-off and have not been validated for equivalent recovery. If you are willing to trade output size or compression behavior for speed, try `--preset veryfast` and verify the output with a round trip. `--compress` profiles can also change ECC and recovery margin; leave them unset to keep the original defaults.
-- Large files still produce long videos: use `estimate` to check exact frame count and playback duration first. It does not predict MP4 size or encode time. For Bit2Vid v1 compatibility a single encrypted message must be smaller than 64 GiB.
-
-### Example benchmark
-
-On a two-vCPU Linux machine with FFmpeg 8, using the same 256 KiB input and default settings, Bit2Vid Python took 8.42 s to encode and 3.34 s to decode; file2video took 6.02 s and 0.68 s. Both restored exactly the same bytes and produced MP4s of about 944 kB. These are single-run timings, not estimates for a 1 GiB encode. In a separate parity-only test on that machine, the Rust path produced about 1.34 million RS(255,191) codewords/s (128 MiB input), versus about 1,350 codewords/s for Bit2Vid's two-worker Python path (1 MiB input). The parity benchmark excludes H.264; x264 remains the main encode cost.
-
-## Develop or release
-
-From a checkout with the Rust toolchain and FFmpeg installed:
-
-```sh
-cargo build --release --locked
+cargo build --release --locked      # binary: target/release/file2video
 cargo test --release --locked
 cargo clippy --locked --all-targets -- -D warnings
+```
+
+Optional error-correction throughput measurement:
+
+```sh
 cargo test --release --locked ecc_throughput -- --ignored --nocapture
 ```
 
-CI builds and tests the CLI for Windows x64, Linux x64/ARM64 and macOS x64/ARM64. Both macOS jobs use Apple Silicon runners; the Intel binary is cross-compiled and tested through Rosetta, which is only needed for CI, not for running the binary on an Intel Mac. Linux CI also checks Python → Rust and Rust → Python against a pinned Bit2Vid checkout.
+CI builds and tests Windows x64, Linux x64/ARM64 and macOS x64/ARM64. On Linux x64 it also runs `tests/interoperability.py`, which checks Python → Rust and Rust → Python against a pinned Bit2Vid commit (needs `numpy`, `pycryptodome`, `reedsolo` and `tqdm`; see the CI workflow for the versions).
 
-Pushes and merges to `main` publish automatically after all platform builds pass. The release is tied to the exact tested commit using an automatically created `build-<commit>` tag. Rerunning a build does not create a duplicate or replace an existing release. To publish a separate numbered release, push a `vX.Y.Z` tag matching the version in `Cargo.toml`.
+## Releases
+
+- Every push to `main` that passes all platform builds publishes a release tagged `build-<commit>` with all five archives and their SHA-256 files. A rerun never creates a duplicate.
+- Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` publishes a numbered release.
+- Pull request builds are only available as temporary [Actions artifacts](https://github.com/VulcanoSoftware/file2video/actions/workflows/ci.yml).
