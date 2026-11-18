@@ -40,6 +40,9 @@ struct Cli {
     /// Thread limit for each of the Rust ECC pool and FFmpeg (0 = automatic).
     #[arg(long, global = true, default_value_t = 0)]
     threads: usize,
+    /// Hardware encoder for the video (auto/off/amf/nvenc/qsv/vaapi/video-toolbox).
+    #[arg(long, global = true, value_enum, default_value_t = video::Gpu::Auto)]
+    gpu: video::Gpu,
 }
 
 #[derive(Subcommand)]
@@ -443,6 +446,7 @@ fn run() -> Result<()> {
         ffmpeg: cli.ffmpeg.unwrap_or_else(|| video::default_ffmpeg().into()),
         ffprobe: cli.ffprobe,
         threads: cli.threads,
+        gpu: cli.gpu,
     };
     if cli.threads != 0 {
         rayon::ThreadPoolBuilder::new()

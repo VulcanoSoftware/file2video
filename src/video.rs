@@ -1,10 +1,118 @@
 use crate::format::{BLOCK_SIZES, Grid, TRANSPORT_SIZE, parse_transport, validate_resolution};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use clap::ValueEnum;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Gpu {
+    /// Pick the first working hardware encoder, or fall back to CPU.
+    Auto,
+    /// Always encode with CPU libx264.
+    Off,
+    /// AMD AMF (Windows).
+    Amf,
+    /// NVIDIA NVENC (Windows/Linux).
+    Nvenc,
+    /// Intel Quick Sync (Windows/Linux).
+    Qsv,
+    /// VA-API (Linux).
+    Vaapi,
+    /// VideoToolbox (macOS).
+    VideoToolbox,
+}
+
+impl Gpu {
+    const VAAPI_DEVICE: &'static str = "/dev/dri/renderD128";
+
+    fn encoder_name(self) -> &'static str {
+        match self {
+            Self::Amf => "h264_amf",
+            Self::Nvenc => "h264_nvenc",
+            Self::Qsv => "h264_qsv",
+            Self::Vaapi => "h264_vaapi",
+            Self::VideoToolbox => "h264_videotoolbox",
+            Self::Auto | Self::Off => unreachable!(),
+        }
+    }
+
+    fn candidates() -> &'static [Self] {
+        if cfg!(windows) {
+            &[Self::Amf, Self::Nvenc, Self::Qsv]
+        } else if cfg!(target_os = "macos") {
+            &[Self::VideoToolbox]
+        } else {
+            &[Self::Vaapi, Self::Nvenc, Self::Qsv]
+        }
+    }
+
+    fn device_args(self) -> Vec<String> {
+        if self == Self::Vaapi {
+            vec![
+                "-init_hw_device".to_owned(),
+                format!("vaapi=hw:{}", Self::VAAPI_DEVICE),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn filter_chain(self, scale: &str) -> String {
+        if self == Self::Vaapi {
+            format!("{scale},format=nv12,hwupload")
+        } else {
+            scale.to_owned()
+        }
+    }
+
+    fn passes_pix_fmt(self) -> bool {
+        self != Self::Vaapi
+    }
+
+    fn quality_args(self, crf: u8, preset: &str) -> Vec<String> {
+        let mut args = Vec::new();
+        match self {
+            Self::Amf => {
+                args.push("-quality".into());
+                args.push(amf_quality(preset).into());
+                args.push("-rc".into());
+                args.push("cqp".into());
+                for option in ["-qp_i", "-qp_p", "-qp_b"] {
+                    args.push(option.into());
+                    args.push(crf.to_string());
+                }
+            }
+            Self::Nvenc => {
+                args.push("-preset".into());
+                args.push(nvenc_preset(preset).into());
+                args.extend(["-rc".into(), "vbr".into()]);
+                args.push("-cq".into());
+                args.push(crf.to_string());
+                args.extend(["-b:v".into(), "0".into()]);
+            }
+            Self::Qsv => {
+                args.push("-preset".into());
+                args.push(preset.into());
+                args.push("-global_quality".into());
+                args.push(crf.to_string());
+            }
+            Self::Vaapi => {
+                args.extend(["-rc_mode".into(), "CQP".into()]);
+                args.push("-qp".into());
+                args.push(crf.to_string());
+            }
+            Self::VideoToolbox => {
+                args.push("-q:v".into());
+                args.push(vt_quality(crf).to_string());
+            }
+            Self::Auto | Self::Off => unreachable!(),
+        }
+        args
+    }
+}
 
 pub fn local_path(path: &Path) -> PathBuf {
     // Force FFmpeg's local-file protocol, including paths containing colons.
@@ -17,6 +125,7 @@ pub struct Tools {
     pub ffmpeg: PathBuf,
     pub ffprobe: Option<PathBuf>,
     pub threads: usize,
+    pub gpu: Gpu,
 }
 
 impl Tools {
@@ -72,7 +181,13 @@ impl Tools {
             "scale={}:{}:flags=neighbor,setsar=1",
             grid.width, grid.height
         );
+        let encoder = self.select_encoder(settings.crf)?;
         let mut cmd = self.command();
+        if let Encoder::Gpu(backend) = encoder {
+            for arg in backend.device_args() {
+                cmd.arg(arg);
+            }
+        }
         cmd.args([
             "-y",
             "-f",
@@ -81,7 +196,7 @@ impl Tools {
             "gray",
             "-video_size",
         ])
-        .arg(small)
+        .arg(&small)
         .args([
             "-framerate",
             &settings.fps.to_string(),
@@ -91,24 +206,114 @@ impl Tools {
             "-filter_threads",
             "1",
             "-vf",
-            &scale,
-            "-c:v",
-            "libx264",
-            "-preset",
-            &settings.preset,
-            "-crf",
-            &settings.crf.to_string(),
-            "-threads:v",
-            &self.threads.to_string(),
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "mp4",
-        ])
-        .arg(local_path(output))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null());
+        ]);
+        let quality: Vec<String>;
+        match encoder {
+            Encoder::Cpu => {
+                cmd.arg(&scale)
+                    .args(["-c:v", "libx264", "-preset", &settings.preset])
+                    .args(["-crf", &settings.crf.to_string()])
+                    .args(["-threads:v", &self.threads.to_string()])
+                    .args(["-pix_fmt", "yuv420p", "-f", "mp4"]);
+            }
+            Encoder::Gpu(backend) => {
+                cmd.arg(backend.filter_chain(&scale))
+                    .args(["-c:v", backend.encoder_name()]);
+                quality = backend.quality_args(settings.crf, &settings.preset);
+                cmd.args(&quality);
+                if backend.passes_pix_fmt() {
+                    cmd.args(["-pix_fmt", "yuv420p"]);
+                }
+                cmd.args(["-f", "mp4"]);
+            }
+        }
+        cmd.arg(local_path(output))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
         self.spawn(cmd)
+    }
+
+    fn encoder_list(&self) -> Result<String> {
+        let out = Command::new(&self.ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .with_context(|| format!("could not run {}", self.ffmpeg.display()))?;
+        ensure!(
+            out.status.success(),
+            "FFmpeg encoder list failed ({})",
+            out.status
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    // A tiny trial encode: hardware encoders can be listed yet still fail
+    // without a usable device. 2 frames of 64x64 keep this fast.
+    fn preflight(&self, backend: Gpu, crf: u8) -> bool {
+        let mut cmd = Command::new(&self.ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for arg in backend.device_args() {
+            cmd.arg(arg);
+        }
+        cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=0.1"])
+            .args(["-frames:v", "2", "-vf"]);
+        if backend.passes_pix_fmt() {
+            cmd.arg("format=yuv420p");
+        } else {
+            cmd.arg("format=nv12,hwupload");
+        }
+        cmd.args(["-c:v", backend.encoder_name()]);
+        let args = backend.quality_args(crf, "slow");
+        for arg in &args {
+            cmd.arg(arg);
+        }
+        cmd.args(["-f", "null", "-"]);
+        cmd.status().is_ok_and(|status| status.success())
+    }
+
+    fn select_encoder(&self, crf: u8) -> Result<Encoder> {
+        if self.gpu == Gpu::Off {
+            return Ok(Encoder::Cpu);
+        }
+        let forced = self.gpu != Gpu::Auto && self.gpu != Gpu::Off;
+        let list = self.encoder_list()?;
+        let candidates = if forced {
+            std::slice::from_ref(&self.gpu)
+        } else {
+            Gpu::candidates()
+        };
+        for backend in candidates {
+            if !list
+                .split_whitespace()
+                .any(|word| word == backend.encoder_name())
+            {
+                if forced {
+                    bail!(
+                        "{} is not part of this FFmpeg build; pass --gpu off or install an FFmpeg with it",
+                        backend.encoder_name()
+                    );
+                }
+                continue;
+            }
+            if self.preflight(*backend, crf) {
+                eprintln!("Encoding with {} on the GPU.", backend.encoder_name());
+                return Ok(Encoder::Gpu(*backend));
+            }
+            if forced {
+                bail!(
+                    "{} failed its trial encode; check drivers and permissions, or pass --gpu off",
+                    backend.encoder_name()
+                );
+            }
+        }
+        if self.gpu == Gpu::Auto {
+            eprintln!("No usable GPU encoder found; falling back to CPU encoding (libx264).");
+        }
+        Ok(Encoder::Cpu)
     }
 
     pub fn decode(&self, input: &Path) -> Result<Process> {
@@ -189,6 +394,35 @@ impl Tools {
             waited: false,
         })
     }
+}
+
+enum Encoder {
+    Cpu,
+    Gpu(Gpu),
+}
+
+fn amf_quality(preset: &str) -> &'static str {
+    match preset {
+        "ultrafast" | "superfast" | "veryfast" | "faster" => "speed",
+        "fast" | "medium" => "balanced",
+        _ => "quality",
+    }
+}
+
+fn nvenc_preset(preset: &str) -> &'static str {
+    match preset {
+        "ultrafast" => "p1",
+        "superfast" => "p2",
+        "veryfast" => "p3",
+        "faster" | "fast" => "p4",
+        "medium" => "p5",
+        "slow" | "slower" => "p6",
+        _ => "p7",
+    }
+}
+
+fn vt_quality(crf: u8) -> u8 {
+    100u8.saturating_sub(crf)
 }
 
 fn frame_sync_for(version_line: &str) -> [&'static str; 2] {
@@ -530,7 +764,7 @@ pub fn default_ffmpeg() -> &'static OsStr {
 
 #[cfg(test)]
 mod tests {
-    use super::frame_sync_for;
+    use super::{Gpu, amf_quality, frame_sync_for, nvenc_preset, vt_quality};
 
     #[test]
     fn chooses_supported_frame_sync_option() {
@@ -546,5 +780,23 @@ mod tests {
                 ["-fps_mode", "passthrough"]
             );
         }
+    }
+
+    #[test]
+    fn maps_presets_and_quality_to_gpu_encoders() {
+        assert_eq!(nvenc_preset("slow"), "p6");
+        assert_eq!(nvenc_preset("veryfast"), "p3");
+        assert_eq!(nvenc_preset("veryslow"), "p7");
+        assert_eq!(amf_quality("slow"), "quality");
+        assert_eq!(amf_quality("medium"), "balanced");
+        assert_eq!(amf_quality("ultrafast"), "speed");
+        assert_eq!(vt_quality(18), 82);
+        assert_eq!(vt_quality(0), 100);
+    }
+
+    #[test]
+    fn gpu_backends_have_expected_encoders() {
+        assert_eq!(Gpu::Nvenc.encoder_name(), "h264_nvenc");
+        assert_eq!(Gpu::Vaapi.encoder_name(), "h264_vaapi");
     }
 }
