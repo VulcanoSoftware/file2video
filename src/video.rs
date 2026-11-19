@@ -250,12 +250,12 @@ impl Tools {
 
     // A tiny trial encode: hardware encoders can be listed yet still fail
     // without a usable device. 2 frames of 64x64 keep this fast.
-    fn preflight(&self, backend: Gpu, crf: u8) -> bool {
+    // A tiny trial encode: hardware encoders can be listed yet still fail
+    // without a usable device. 2 frames of 64x64 keep this fast.
+    fn preflight(&self, backend: Gpu, crf: u8) -> Result<(), String> {
         let mut cmd = Command::new(&self.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
         for arg in backend.device_args() {
             cmd.arg(arg);
         }
@@ -272,7 +272,20 @@ impl Tools {
             cmd.arg(arg);
         }
         cmd.args(["-f", "null", "-"]);
-        cmd.status().is_ok_and(|status| status.success())
+        match cmd.stderr(Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                let mut pipe = child.stderr.take().unwrap();
+                let mut text = String::new();
+                let status = child.wait();
+                let _ = pipe.read_to_string(&mut text);
+                match status {
+                    Ok(status) if status.success() => Ok(()),
+                    Ok(status) => Err(trial_failure(&text, &status.to_string())),
+                    Err(error) => Err(trial_failure(&text, &error.to_string())),
+                }
+            }
+            Err(error) => Err(trial_failure("", &error.to_string())),
+        }
     }
 
     fn select_encoder(&self, crf: u8) -> Result<Encoder> {
@@ -287,31 +300,35 @@ impl Tools {
             Gpu::candidates()
         };
         for backend in candidates {
-            if !list
-                .split_whitespace()
-                .any(|word| word == backend.encoder_name())
-            {
+            let name = backend.encoder_name();
+            if !list.split_whitespace().any(|word| word == name) {
                 if forced {
                     bail!(
-                        "{} is not part of this FFmpeg build; pass --gpu off or install an FFmpeg with it",
-                        backend.encoder_name()
+                        "{name} is not part of this FFmpeg build; pass --gpu off or install an FFmpeg with it"
                     );
                 }
+                eprintln!("GPU encoder {name} is not in this FFmpeg build; skipping.");
                 continue;
             }
-            if self.preflight(*backend, crf) {
-                eprintln!("Encoding with {} on the GPU.", backend.encoder_name());
-                return Ok(Encoder::Gpu(*backend));
-            }
-            if forced {
-                bail!(
-                    "{} failed its trial encode; check drivers and permissions, or pass --gpu off",
-                    backend.encoder_name()
-                );
+            match self.preflight(*backend, crf) {
+                Ok(()) => {
+                    eprintln!("Encoding with {name} on the GPU.");
+                    return Ok(Encoder::Gpu(*backend));
+                }
+                Err(reason) if forced => bail!(
+                    "{name} failed its trial encode: {reason}\nCheck your GPU driver, or pass --gpu off to encode on the CPU"
+                ),
+                Err(reason) => {
+                    eprintln!(
+                        "GPU encoder {name} failed its trial encode: {reason}; trying the next option."
+                    );
+                }
             }
         }
         if self.gpu == Gpu::Auto {
-            eprintln!("No usable GPU encoder found; falling back to CPU encoding (libx264).");
+            eprintln!(
+                "No usable GPU encoder found; falling back to CPU encoding (libx264).\nUpdate your GPU drivers so that the encoder becomes usable, or pass --gpu off to silence this."
+            );
         }
         Ok(Encoder::Cpu)
     }
@@ -399,6 +416,16 @@ impl Tools {
 enum Encoder {
     Cpu,
     Gpu(Gpu),
+}
+
+fn trial_failure(stderr: &str, fallback: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
 }
 
 fn amf_quality(preset: &str) -> &'static str {
@@ -764,7 +791,7 @@ pub fn default_ffmpeg() -> &'static OsStr {
 
 #[cfg(test)]
 mod tests {
-    use super::{Gpu, amf_quality, frame_sync_for, nvenc_preset, vt_quality};
+    use super::{Gpu, amf_quality, frame_sync_for, nvenc_preset, trial_failure, vt_quality};
 
     #[test]
     fn chooses_supported_frame_sync_option() {
@@ -798,5 +825,19 @@ mod tests {
     fn gpu_backends_have_expected_encoders() {
         assert_eq!(Gpu::Nvenc.encoder_name(), "h264_nvenc");
         assert_eq!(Gpu::Vaapi.encoder_name(), "h264_vaapi");
+    }
+
+    #[test]
+    fn trial_failures_show_the_meaningful_error_line() {
+        for stderr in ["", "  \n"] {
+            assert_eq!(trial_failure(stderr, "exit status 1"), "exit status 1");
+        }
+        assert_eq!(
+            trial_failure(
+                "Warning: x\nError: amf init failed: AMF_NO_DLL\n",
+                "exit status 1"
+            ),
+            "Error: amf init failed: AMF_NO_DLL"
+        );
     }
 }
