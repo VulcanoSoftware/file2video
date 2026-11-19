@@ -7,15 +7,30 @@ Command-line tool that turns any file into an encrypted H.264 MP4 video and rest
 ## Requirements
 
 - A prebuilt binary from [GitHub Releases](https://github.com/VulcanoSoftware/file2video/releases) (no Rust or Python needed).
-- [FFmpeg](https://ffmpeg.org/download.html) with `libx264`, plus `ffprobe`, on your `PATH`.
+- FFmpeg with `libx264`, plus `ffprobe` — downloaded automatically on first use when it is missing (see [FFmpeg auto-download](#ffmpeg-auto-download)), or installed manually:
 
-| Platform | Install FFmpeg |
+| Platform | Manual install |
 | --- | --- |
 | Windows x64 | `winget install --id Gyan.FFmpeg -e`, then reopen your terminal |
 | Ubuntu / Debian | `sudo apt install ffmpeg` |
 | macOS | `brew install ffmpeg` |
 
 Check with `ffmpeg -version` and `ffprobe -version`. If FFmpeg is not on your `PATH`, pass `--ffmpeg /path/to/ffmpeg`; `ffprobe` is looked up next to it unless you set `--ffprobe`. FFmpeg versions before and after 5.1 are both supported.
+
+## FFmpeg auto-download
+
+`encode` and `decode` need FFmpeg, and GPU-accelerated encoding needs a build that includes hardware H.264 encoders. When the FFmpeg on the `PATH` is missing (or has no hardware encoders), the tool downloads a full static build on first use and caches it:
+
+| System | Source | Cached in |
+| --- | --- | --- |
+| Windows x64 | [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest) (includes AMF, NVENC, Quick Sync) | `%LOCALAPPDATA%\file2video` |
+| Linux x64 / ARM64 | [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest) (includes VA-API, NVENC, Quick Sync) | `$XDG_CACHE_HOME/file2video` or `~/.cache/file2video` |
+| macOS | [evermeet.cx](https://evermeet.cx/ffmpeg/) | as on Linux |
+
+- Downloading needs `curl` (shipping with Windows 10+, macOS, and most Linux distributions) and `tar`. Archives are fetched over HTTPS from the sources above.
+- The hardware encoder support is compiled into the downloaded FFmpeg build. GPU **drivers** come from your GPU vendor and are never installed by this tool.
+- Set the `FILE2VIDEO_CACHE` environment variable to choose the cache location, pass `--no-download` to keep everything local, or `--ffmpeg <PATH>` to use a specific FFmpeg. When no download is possible, the tool continues with the FFmpeg on your system as before.
+- The download happens once; later runs reuse the cached build. Delete the cache directory to force a fresh download of the current build.
 
 ## Install
 
@@ -89,7 +104,8 @@ Prints the exact encrypted size, frame count and playback duration for a file, w
 
 | Option | Description |
 | --- | --- |
-| `--ffmpeg <PATH>` | FFmpeg executable (default: from `PATH`). |
+| `--ffmpeg <PATH>` | FFmpeg executable (default: from `PATH`, auto-downloaded when missing). |
+| `--no-download` | Never download FFmpeg; use what is already on the system. |
 | `--ffprobe <PATH>` | ffprobe executable (default: next to FFmpeg, else `PATH`). |
 | `--threads <N>` | Thread limit for the Rust error-correction pool and for FFmpeg (`0` = automatic). |
 
