@@ -1,4 +1,5 @@
 mod crypto;
+mod diag;
 mod download;
 mod ecc;
 mod format;
@@ -473,6 +474,7 @@ fn pick_ffmpeg(cli: &Cli) -> PathBuf {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     ensure!(cli.threads <= 256, "--threads must be in 0..=256");
+    let with_video = uses_video(&cli);
     let tools = video::Tools {
         ffmpeg: pick_ffmpeg(&cli),
         ffprobe: cli.ffprobe,
@@ -483,6 +485,9 @@ fn run() -> Result<()> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(cli.threads)
             .build_global()?;
+    }
+    if with_video {
+        diag::print(&tools.ffmpeg);
     }
     let start = Instant::now();
     match cli.command {

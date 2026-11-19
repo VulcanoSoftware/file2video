@@ -110,6 +110,24 @@ Prints the exact encrypted size, frame count and playback duration for a file, w
 | `--gpu <MODE>` | Hardware encoder for `encode`: `auto` (default), `off`, `amf`, `nvenc`, `qsv`, `vaapi`, `video-toolbox`. See [GPU acceleration](#gpu-acceleration). |
 | `--threads <N>` | Thread limit for the Rust error-correction pool and for FFmpeg (`0` = automatic). |
 
+## Diagnostics
+
+`encode` and `decode` print a diagnostics block to stderr before starting:
+
+```text
+System: windows x86_64 | AMD Ryzen 5 230 (16 threads) | 15.8 GB
+GPU: AMD Radeon 760M (driver 32.0.11021.2)
+FFmpeg: ffmpeg version N-118233-g... | hardware encoders: ["h264_amf", "h264_nvenc", "h264_qsv"]
+```
+
+During long runs, progress lines show frames, percentage, throughput in MB/s, elapsed time and ETA:
+
+```text
+Encode: 90000/353959 frames (25.4%) | 21.3 MB/s | elapsed 1m07s | eta 3m18s
+```
+
+Set `FILE2VIDEO_DEBUG=1` to also print the exact FFmpeg command used for each GPU trial encode, which is useful when reporting a problem.
+
 ## Passwords
 
 `encode` asks for a password and a confirmation; `decode` asks once. For scripts, use `--password-file <FILE>`: a UTF-8 text file of at most 64 KiB, of which one trailing newline is ignored. `--password <TEXT>` also works but can leak through shell history and process lists. The two options cannot be combined, and an empty password is rejected.
