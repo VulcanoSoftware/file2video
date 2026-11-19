@@ -249,9 +249,9 @@ impl Tools {
     }
 
     // A tiny trial encode: hardware encoders can be listed yet still fail
-    // without a usable device. 2 frames of 64x64 keep this fast.
-    // A tiny trial encode: hardware encoders can be listed yet still fail
-    // without a usable device. 2 frames of 64x64 keep this fast.
+    // without a usable device. The source must emit more frames than the
+    // encoder buffers internally, or the null muxer receives no packets and
+    // FFmpeg aborts with an unrelated error.
     fn preflight(&self, backend: Gpu, crf: u8) -> Result<(), String> {
         let mut cmd = Command::new(&self.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
@@ -259,8 +259,8 @@ impl Tools {
         for arg in backend.device_args() {
             cmd.arg(arg);
         }
-        cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=0.1"])
-            .args(["-frames:v", "2", "-vf"]);
+        cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=1"])
+            .arg("-vf");
         if backend.passes_pix_fmt() {
             cmd.arg("format=yuv420p");
         } else {
