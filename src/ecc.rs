@@ -166,7 +166,7 @@ impl Codec {
 
     // Grow the read and recovery buffers once; the caller can consume aligned
     // AES chunks regardless of the RS word size.
-    pub fn reader(&self, input: impl Read, size: u64) -> Reader<'_, impl Read> {
+    pub fn reader<R: Read>(&self, input: R, size: u64) -> Reader<'_, R> {
         Reader {
             codec: self,
             input,
@@ -187,6 +187,14 @@ pub struct Reader<'a, R> {
     plain: Vec<u8>,
     pos: usize,
     end: usize,
+}
+
+impl<'a, R> Reader<'a, R> {
+    // Lets the caller adjust the underlying source (frame progress display)
+    // after the reader already borrows it for the payload reads.
+    pub fn input_mut(&mut self) -> &mut R {
+        &mut self.input
+    }
 }
 
 impl<R: Read> Reader<'_, R> {

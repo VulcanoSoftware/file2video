@@ -162,6 +162,7 @@ pub fn parse_transport(data: &[u8]) -> Result<Transport> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub encrypted: u64,
     pub words: u32,
@@ -170,12 +171,29 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(encrypted: u64, parity: usize) -> Result<Self> {
+        Self::build(encrypted, parity, false)
+    }
+
+    /// Compact layout: the 30-byte ECC header is the start of the first
+    /// codeword's data area so Reed-Solomon corrects it; word sizing
+    /// includes it. The transport header keeps the same protected length
+    /// shape (30 + words * 255) in both modes.
+    pub fn compact(encrypted: u64, parity: usize) -> Result<Self> {
+        Self::build(encrypted, parity, true)
+    }
+
+    fn build(encrypted: u64, parity: usize, compact: bool) -> Result<Self> {
         ensure!((1..=127).contains(&parity), "parity must be in 1..=127");
         ensure!(
             (CRYPTO_SIZE as u64..=CRYPTO_SIZE as u64 + MAX_GCM).contains(&encrypted),
             "payload exceeds the Bit2Vid v1 AES-GCM size limit"
         );
-        let words = u32::try_from(encrypted.div_ceil((255 - parity) as u64))?;
+        let data = if compact {
+            encrypted + ECC_SIZE as u64
+        } else {
+            encrypted
+        };
+        let words = u32::try_from(data.div_ceil((255 - parity) as u64))?;
         Ok(Self {
             encrypted,
             words,
@@ -198,8 +216,13 @@ impl Layout {
         out
     }
 
-    pub fn parse(header: &[u8; ECC_SIZE], parity: usize, protected: u64) -> Result<Self> {
-        let layout = Self::new(u64_at(header, 22), parity)?;
+    pub fn parse(
+        header: &[u8; ECC_SIZE],
+        parity: usize,
+        protected: u64,
+        compact: bool,
+    ) -> Result<Self> {
+        let layout = Self::build(u64_at(header, 22), parity, compact)?;
         ensure!(
             layout.protected == protected && *header == layout.ecc_header(parity),
             "invalid or corrupted Reed-Solomon header"
@@ -249,4 +272,32 @@ pub fn parse_metadata(first: &[u8], size: u64) -> Result<(Option<&str>, usize)> 
         "invalid path in stored filename"
     );
     Ok((Some(name), offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ECC_SIZE, Layout};
+
+    #[test]
+    fn compact_layout_protects_the_ecc_header_in_word_zero() {
+        let compact = Layout::compact(1910, 64).unwrap();
+        let plain = Layout::new(1910, 64).unwrap();
+        assert_eq!(compact.words, plain.words + 1);
+        assert_eq!(
+            compact.protected,
+            ECC_SIZE as u64 + compact.words as u64 * 255
+        );
+        let header = compact.ecc_header(64);
+        assert_eq!(
+            Layout::parse(&header, 64, compact.protected, true).unwrap(),
+            compact
+        );
+        assert!(Layout::parse(&header, 64, compact.protected, false).is_err());
+        let plain_header = plain.ecc_header(64);
+        assert_eq!(
+            Layout::parse(&plain_header, 64, plain.protected, false).unwrap(),
+            plain
+        );
+        assert!(Layout::parse(&plain_header, 64, plain.protected, true).is_err());
+    }
 }

@@ -148,7 +148,7 @@ struct Encoding {
     /// Use a smaller-output Bit2Vid profile (can reduce recovery margin).
     #[arg(long, value_enum)]
     compress: Option<Profile>,
-    /// x264 quality (default: 18, or set by --compress).
+    /// x264 quality (default: 18, or set by --compress; capped at 10 in default compact mode so cell data survives).
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
     crf: Option<u8>,
     /// x264 speed/size preset (default: slow, or set by --compress).
@@ -259,7 +259,12 @@ fn encode(
         .checked_add(metadata.len() as u64)
         .context("input size overflow")?;
     let mut header = crypto::Header::new(iterations, plain_size)?;
-    let layout = Layout::new(plain_size + CRYPTO_SIZE as u64, parity)?;
+    let encrypted_size = plain_size + CRYPTO_SIZE as u64;
+    let layout = if settings.compact {
+        Layout::compact(encrypted_size, parity)?
+    } else {
+        Layout::new(encrypted_size, parity)?
+    };
     let password = password.get(true)?;
     let mut crypto = crypto::Stream::new(&header, &password);
     drop(password);
@@ -313,8 +318,20 @@ fn encode(
         settings.cell_bits,
         settings.compact,
     ))?;
-    sink.push(&layout.ecc_header(parity))?;
-    ecc::Codec::new(parity).encode(encrypted, layout.encrypted, |data| sink.push(data))?;
+    let codec = ecc::Codec::new(parity);
+    if settings.compact {
+        // In compact mode the ECC header leads the first Reed-Solomon word's
+        // data, so parity protects it against quantization noise too.
+        let ecc_header = layout.ecc_header(parity);
+        codec.encode(
+            ecc_header.as_slice().chain(encrypted),
+            ECC_SIZE as u64 + layout.encrypted,
+            |data| sink.push(data),
+        )?;
+    } else {
+        sink.push(&layout.ecc_header(parity))?;
+        codec.encode(encrypted, layout.encrypted, |data| sink.push(data))?;
+    }
     sink.finish()?;
     process.finish()?;
     publish(tmp, output)
@@ -387,12 +404,26 @@ fn decode(
         .take()
         .context("missing FFmpeg stdout")?;
     let (mut frames, parity, protected) = video::Source::open(pipe, width, height, options.block)?;
-    let mut ecc_header = [0; ECC_SIZE];
-    frames.read_exact(&mut ecc_header)?;
-    let layout = Layout::parse(&ecc_header, parity, protected)?;
-    frames.set_frames(layout.frames(frames.grid(), frames.cell_bits()));
+    let grid = frames.grid();
+    let cell_bits = frames.cell_bits();
     let codec = ecc::Codec::new(parity);
-    let mut reader = codec.reader(&mut frames, layout.encrypted);
+    let mut ecc_header = [0; ECC_SIZE];
+    let (mut reader, layout) = if frames.compact() {
+        // Plain allowance for the codewords: words carry 255 - parity data
+        // bytes each, which is all the encoder ever wrote.
+        let words = (protected - ECC_SIZE as u64) / 255;
+        let mut stream = codec.reader(&mut frames, words * (255 - parity) as u64);
+        stream.read_exact(&mut ecc_header)?;
+        let layout = Layout::parse(&ecc_header, parity, protected, true)?;
+        (stream, layout)
+    } else {
+        frames.read_exact(&mut ecc_header)?;
+        let layout = Layout::parse(&ecc_header, parity, protected, false)?;
+        (codec.reader(&mut frames, layout.encrypted), layout)
+    };
+    reader
+        .input_mut()
+        .set_frames(layout.frames(grid, cell_bits));
     let mut header = [0; CRYPTO_SIZE];
     reader.read_exact(&mut header)?;
     let header = crypto::Header::parse(&header, layout.encrypted - CRYPTO_SIZE as u64)?;
@@ -440,7 +471,11 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
     let encrypted = size
         .checked_add(metadata + CRYPTO_SIZE as u64)
         .context("input size overflow")?;
-    let layout = Layout::new(encrypted, parity)?;
+    let layout = if settings.compact {
+        Layout::compact(encrypted, parity)?
+    } else {
+        Layout::new(encrypted, parity)?
+    };
     let frames = layout.frames(settings.grid, settings.cell_bits);
     println!("Input:            {size} bytes");
     println!("Encrypted:        {} bytes", layout.encrypted);

@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
+// The default CRF loses dozens of single-pixel luma levels per frame; crf 10
+// keeps the residual cell noise far below the Reed-Solomon correction budget
+// while still letting the encoder do most of the compression work.
+const COMPACT_MAX_CRF: u8 = 10;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Gpu {
     /// Pick the first working hardware encoder, or fall back to CPU.
@@ -217,7 +222,16 @@ impl Tools {
                 grid.width, grid.height
             )
         };
-        let encoder = self.select_encoder(settings.crf)?;
+        // One cell is one video pixel; even sparse quantization noise breaks
+        // a cell value, so compact mode caps every quality setting at a level
+        // whose Reed-Solomon overhead stays comfortably below the correction
+        // capacity of the frame, regardless of what the caller passed.
+        let crf = if settings.compact {
+            settings.crf.min(COMPACT_MAX_CRF)
+        } else {
+            settings.crf
+        };
+        let encoder = self.select_encoder(crf)?;
         let mut cmd = self.command();
         if let Encoder::Gpu(backend) = encoder {
             for arg in backend.device_args() {
@@ -248,14 +262,14 @@ impl Tools {
             Encoder::Cpu => {
                 cmd.arg(&scale)
                     .args(["-c:v", "libx264", "-preset", &settings.preset])
-                    .args(["-crf", &settings.crf.to_string()])
+                    .args(["-crf", &crf.to_string()])
                     .args(["-threads:v", &self.threads.to_string()])
                     .args(["-pix_fmt", "yuv420p", "-f", "mp4"]);
             }
             Encoder::Gpu(backend) => {
                 cmd.arg(backend.filter_chain(&scale))
                     .args(["-c:v", backend.encoder_name()]);
-                quality = backend.quality_args(settings.crf, &settings.preset);
+                quality = backend.quality_args(crf, &settings.preset);
                 cmd.args(&quality);
                 if backend.passes_pix_fmt() {
                     cmd.args(["-pix_fmt", "yuv420p"]);
@@ -845,6 +859,7 @@ pub struct Source<R> {
     sampler: Sampler,
     packer: Packer,
     cell_bits: u8,
+    compact: bool,
     read: u64,
     bytes: u64,
     progress: Progress,
@@ -899,6 +914,7 @@ impl<R: Read> Source<R> {
                             sampler: sample,
                             packer: packer(cell_bits),
                             cell_bits,
+                            compact: false,
                             read: 1,
                             bytes: 0,
                             progress: Progress::new("Decode", 1),
@@ -934,6 +950,7 @@ impl<R: Read> Source<R> {
                             sampler: sample,
                             packer: packer(cell_bits),
                             cell_bits,
+                            compact: true,
                             read: 1,
                             bytes: 0,
                             progress: Progress::new("Decode", 1),
@@ -957,6 +974,10 @@ impl<R: Read> Source<R> {
 
     pub fn cell_bits(&self) -> u8 {
         self.cell_bits
+    }
+
+    pub fn compact(&self) -> bool {
+        self.compact
     }
 
     fn next_frame(&mut self) -> io::Result<()> {
