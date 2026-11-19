@@ -272,6 +272,18 @@ impl Tools {
             cmd.arg(arg);
         }
         cmd.args(["-f", "null", "-"]);
+        if debug() {
+            let quoted: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            eprintln!(
+                "Trial encode with {}: {} {}",
+                backend.encoder_name(),
+                cmd.get_program().to_string_lossy(),
+                quoted.join(" ")
+            );
+        }
         match cmd.stderr(Stdio::piped()).spawn() {
             Ok(mut child) => {
                 let mut pipe = child.stderr.take().unwrap();
@@ -418,14 +430,23 @@ enum Encoder {
     Gpu(Gpu),
 }
 
+fn debug() -> bool {
+    std::env::var_os("FILE2VIDEO_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+}
+
 fn trial_failure(stderr: &str, fallback: &str) -> String {
-    stderr
+    let generic = |line: &str| {
+        line.starts_with("[out#") || line.contains("Nothing was written into output file")
+    };
+    let lines: Vec<&str> = stderr
         .lines()
-        .rev()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or(fallback)
-        .to_owned()
+        .filter(|line| !line.is_empty() && !generic(line))
+        .collect();
+    if lines.is_empty() {
+        return fallback.to_owned();
+    }
+    lines.join("; ")
 }
 
 fn amf_quality(preset: &str) -> &'static str {
@@ -506,6 +527,7 @@ impl Drop for Process {
 
 pub struct Progress {
     label: &'static str,
+    started: Instant,
     interval: Instant,
     enabled: bool,
     total: u64,
@@ -516,23 +538,49 @@ impl Progress {
         use std::io::IsTerminal;
         Self {
             label,
+            started: Instant::now(),
             interval: Instant::now(),
             enabled: io::stderr().is_terminal(),
             total,
         }
     }
 
-    pub fn update(&mut self, n: u64) {
+    pub fn update(&mut self, n: u64, bytes: u64) {
         if self.enabled && self.interval.elapsed().as_secs() >= 2 {
+            let elapsed = self.started.elapsed().as_secs_f64();
+            let eta = if n > 0 && self.total > n {
+                human_duration((elapsed / n as f64 * (self.total - n) as f64).ceil() as u64)
+            } else {
+                "?".to_owned()
+            };
             eprintln!(
-                "{}: {n}/{} frames ({:.1}%)",
+                "{}: {n}/{} frames ({:.1}%) | {} | elapsed {} | eta {}",
                 self.label,
                 self.total,
-                (n as f64 / self.total as f64) * 100.0
+                (n as f64 / self.total as f64) * 100.0,
+                speed(bytes, elapsed),
+                human_duration(elapsed.ceil() as u64),
+                eta
             );
             self.interval = Instant::now();
         }
     }
+}
+
+fn human_duration(seconds: u64) -> String {
+    let (minutes, seconds) = (seconds / 60, seconds % 60);
+    if minutes >= 60 {
+        format!("{}h{:02}m{:02}s", minutes / 60, minutes % 60, seconds)
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn speed(bytes: u64, seconds: f64) -> String {
+    let rate = bytes as f64 / seconds / (1024.0 * 1024.0);
+    format!("{rate:.1} MB/s")
 }
 
 const fn expansion() -> [[u8; 8]; 256] {
@@ -555,6 +603,7 @@ pub struct Sink<W> {
     grid: Vec<u8>,
     pos: usize,
     sent: u64,
+    bytes: u64,
     progress: Progress,
 }
 
@@ -565,11 +614,13 @@ impl<W: Write> Sink<W> {
             grid: vec![0; grid.bits()],
             pos: 0,
             sent: 0,
+            bytes: 0,
             progress: Progress::new("Encode", frames),
         }
     }
 
     pub fn push(&mut self, mut bytes: &[u8]) -> Result<()> {
+        self.bytes += bytes.len() as u64;
         while !bytes.is_empty() {
             let n = bytes.len().min((self.grid.len() - self.pos) / 8);
             let end = self.pos + n * 8;
@@ -605,7 +656,7 @@ impl<W: Write> Sink<W> {
             .context("could not send frame to FFmpeg")?;
         self.pos = 0;
         self.sent += 1;
-        self.progress.update(self.sent);
+        self.progress.update(self.sent, self.bytes);
         Ok(())
     }
 
@@ -670,6 +721,7 @@ pub struct Source<R> {
     grid: Grid,
     sampler: Sampler,
     read: u64,
+    bytes: u64,
     progress: Progress,
 }
 
@@ -713,6 +765,7 @@ impl<R: Read> Source<R> {
                         grid,
                         sampler: sample,
                         read: 1,
+                        bytes: 0,
                         progress: Progress::new("Decode", 1),
                     },
                     parity,
@@ -735,7 +788,8 @@ impl<R: Read> Source<R> {
         self.pipe.read_exact(&mut self.image)?;
         (self.sampler)(&self.image, self.grid, &mut self.bits);
         self.read += 1;
-        self.progress.update(self.read);
+        self.bytes += self.bits.len() as u64;
+        self.progress.update(self.read, self.bytes);
         self.pos = 0;
         Ok(())
     }
@@ -791,7 +845,10 @@ pub fn default_ffmpeg() -> &'static OsStr {
 
 #[cfg(test)]
 mod tests {
-    use super::{Gpu, amf_quality, frame_sync_for, nvenc_preset, trial_failure, vt_quality};
+    use super::{
+        Gpu, amf_quality, frame_sync_for, human_duration, nvenc_preset, speed, trial_failure,
+        vt_quality,
+    };
 
     #[test]
     fn chooses_supported_frame_sync_option() {
@@ -807,6 +864,15 @@ mod tests {
                 ["-fps_mode", "passthrough"]
             );
         }
+    }
+
+    #[test]
+    fn formats_durations_and_speeds() {
+        assert_eq!(human_duration(45), "45s");
+        assert_eq!(human_duration(65), "1m05s");
+        assert_eq!(human_duration(3615), "1h00m15s");
+        assert_eq!(speed(150 * 1024 * 1024, 1.5), "100.0 MB/s");
+        assert_eq!(speed(0, 1.5), "0.0 MB/s");
     }
 
     #[test]
@@ -837,7 +903,22 @@ mod tests {
                 "Warning: x\nError: amf init failed: AMF_NO_DLL\n",
                 "exit status 1"
             ),
-            "Error: amf init failed: AMF_NO_DLL"
+            "Warning: x; Error: amf init failed: AMF_NO_DLL"
+        );
+        assert_eq!(
+            trial_failure(
+                "[h264_amf @ 0x1] AMF_NO_DLL\n\
+                 [out#0/null @ 0x2] Nothing was written into output file, because at least one of its streams received no packets.\n",
+                "exit status 1"
+            ),
+            "[h264_amf @ 0x1] AMF_NO_DLL"
+        );
+        assert_eq!(
+            trial_failure(
+                "[out#0/null @ 0x2] Nothing was written into output file, because at least one of its streams received no packets.\n",
+                "exit status 1"
+            ),
+            "exit status 1"
         );
     }
 }

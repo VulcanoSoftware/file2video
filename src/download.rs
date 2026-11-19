@@ -11,7 +11,7 @@ const LINUX_ARM64: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/downlo
 const MACOS_FFMPEG: &str = "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip";
 const MACOS_FFPROBE: &str = "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip";
 
-const HARDWARE_ENCODERS: [&str; 5] = [
+pub const HARDWARE_ENCODERS: [&str; 5] = [
     "h264_amf",
     "h264_nvenc",
     "h264_qsv",
