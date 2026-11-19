@@ -419,13 +419,18 @@ enum Encoder {
 }
 
 fn trial_failure(stderr: &str, fallback: &str) -> String {
-    stderr
+    let generic = |line: &str| {
+        line.starts_with("[out#") || line.contains("Nothing was written into output file")
+    };
+    let lines: Vec<&str> = stderr
         .lines()
-        .rev()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or(fallback)
-        .to_owned()
+        .filter(|line| !line.is_empty() && !generic(line))
+        .collect();
+    if lines.is_empty() {
+        return fallback.to_owned();
+    }
+    lines.join("; ")
 }
 
 fn amf_quality(preset: &str) -> &'static str {
@@ -837,7 +842,22 @@ mod tests {
                 "Warning: x\nError: amf init failed: AMF_NO_DLL\n",
                 "exit status 1"
             ),
-            "Error: amf init failed: AMF_NO_DLL"
+            "Warning: x; Error: amf init failed: AMF_NO_DLL"
+        );
+        assert_eq!(
+            trial_failure(
+                "[h264_amf @ 0x1] AMF_NO_DLL\n\
+                 [out#0/null @ 0x2] Nothing was written into output file, because at least one of its streams received no packets.\n",
+                "exit status 1"
+            ),
+            "[h264_amf @ 0x1] AMF_NO_DLL"
+        );
+        assert_eq!(
+            trial_failure(
+                "[out#0/null @ 0x2] Nothing was written into output file, because at least one of its streams received no packets.\n",
+                "exit status 1"
+            ),
+            "exit status 1"
         );
     }
 }
