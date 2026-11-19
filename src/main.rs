@@ -157,6 +157,9 @@ struct Encoding {
     /// Reed-Solomon parity bytes per 255-byte codeword (default: 64, or set by --compress).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=127))]
     ecc_symbols: Option<u8>,
+    /// Store only black/white cells so Python Bit2Vid 1.0 can decode the result.
+    #[arg(long)]
+    v1: bool,
     /// Number of PBKDF2-HMAC-SHA256 iterations.
     #[arg(long, default_value_t = 600_000, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_KDF)))]
     pbkdf2_iterations: u32,
@@ -182,6 +185,7 @@ impl Encoding {
                 fps: self.fps,
                 crf: self.crf.unwrap_or(crf),
                 preset: self.preset.unwrap_or_else(|| preset.to_owned()),
+                cell_bits: if self.v1 { 1 } else { 4 },
             },
             self.ecc_symbols.map_or(parity, usize::from),
             self.pbkdf2_iterations,
@@ -242,8 +246,11 @@ fn encode(
     let password = password.get(true)?;
     let mut crypto = crypto::Stream::new(&header, &password);
     drop(password);
-    let frames = layout.frames(settings.grid);
-    eprintln!("Encrypting {size} bytes; writing {frames} video frames.");
+    let frames = layout.frames(settings.grid, settings.cell_bits);
+    eprintln!(
+        "Encrypting {size} bytes; writing {frames} video frames ({} luma levels per cell).",
+        1 << settings.cell_bits
+    );
 
     // Bit2Vid places the final GCM tag before the ciphertext. Stage only the
     // ciphertext (never the input file) so the original is read once.
@@ -281,8 +288,13 @@ fn encode(
     let tmp = temporary(dir)?;
     let mut process = tools.encode(&settings, tmp.path())?;
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
-    let mut sink = video::Sink::new(pipe, settings.grid, frames);
-    sink.push(&format::transport(settings.grid, parity, layout.protected))?;
+    let mut sink = video::Sink::new(pipe, settings.grid, settings.cell_bits, frames);
+    sink.push(&format::transport(
+        settings.grid,
+        parity,
+        layout.protected,
+        settings.cell_bits,
+    ))?;
     sink.push(&layout.ecc_header(parity))?;
     ecc::Codec::new(parity).encode(encrypted, layout.encrypted, |data| sink.push(data))?;
     sink.finish()?;
@@ -368,11 +380,14 @@ fn decode(
     let mut ecc_header = [0; ECC_SIZE];
     frames.read_exact(&mut ecc_header)?;
     let layout = Layout::parse(&ecc_header, parity, protected)?;
-    frames.set_frames(layout.frames(Grid {
-        width,
-        height,
-        block: frames.block(),
-    }));
+    frames.set_frames(layout.frames(
+        Grid {
+            width,
+            height,
+            block: frames.block(),
+        },
+        frames.cell_bits(),
+    ));
     let codec = ecc::Codec::new(parity);
     let mut reader = codec.reader(&mut frames, layout.encrypted);
     let mut header = [0; CRYPTO_SIZE];
@@ -423,7 +438,7 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
         .checked_add(metadata + CRYPTO_SIZE as u64)
         .context("input size overflow")?;
     let layout = Layout::new(encrypted, parity)?;
-    let frames = layout.frames(settings.grid);
+    let frames = layout.frames(settings.grid, settings.cell_bits);
     println!("Input:            {size} bytes");
     println!("Encrypted:        {} bytes", layout.encrypted);
     println!(
@@ -433,6 +448,10 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
     println!(
         "Grid:             {}x{} pixels, {} pixels/block",
         settings.grid.width, settings.grid.height, settings.grid.block
+    );
+    println!(
+        "Cell depth:       {} luma levels per cell",
+        1 << settings.cell_bits
     );
     println!("Frames:           {frames}");
     println!(

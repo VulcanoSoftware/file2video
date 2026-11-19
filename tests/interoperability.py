@@ -76,7 +76,7 @@ def main():
         assert (tmp / "restored" / "données.bin").read_bytes() == payload
 
         run(rust, "encode", "données.bin", "rust.mp4", "--width", "648", "--height", "360",
-            "--preset", "fast", "--pbkdf2-iterations", "1000")
+            "--preset", "fast", "--v1", "--pbkdf2-iterations", "1000")
         run(reference, "decode", "rust.mp4", "python-restored.bin", "--width", "648",
             "--height", "360")
         assert (tmp / "python-restored.bin").read_bytes() == payload

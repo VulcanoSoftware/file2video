@@ -88,6 +88,11 @@ fn memory() -> Option<String> {
     }
 }
 
+/// Detected GPUs as reported by the OS, empty when they cannot be listed.
+pub fn gpu_names() -> Vec<String> {
+    gpu().unwrap_or_default()
+}
+
 fn gpu() -> Option<Vec<String>> {
     if cfg!(target_os = "linux") {
         command_output(Command::new("lspci").args(["-nn", "-d", "::03xx"])).map(|text| {

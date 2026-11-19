@@ -75,6 +75,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--crf` | `18` | x264 quality (0–51, lower is better). |
 | `--preset` | `slow` | x264 preset, `ultrafast` to `veryslow`. |
 | `--ecc-symbols` | `64` | Reed-Solomon parity bytes per 255-byte codeword (1–127). |
+| `--v1` | off | Store only black/white cells (2 luma levels) in the Bit2Vid v1 layout, so the original Python Bit2Vid 1.0 can still decode the video. Decoding detects both formats automatically. |
 | `--compress` | off | Smaller-output profile: `light`, `medium` or `high`. |
 | `--pbkdf2-iterations` | `600000` | PBKDF2-HMAC-SHA256 iterations (1–10,000,000). |
 
@@ -82,7 +83,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 
 ### `decode <INPUT> <OUTPUT>`
 
-Recovers the original file from the video. The resolution and block size are detected automatically.
+Recovers the original file from the video. The resolution, block size and cell depth (16 luma levels or plain black/white) are detected automatically.
 
 - If `OUTPUT` is an existing directory, the file is restored there under its original name.
 - If `OUTPUT` is a file path, the file is written to that name. With `--restore-name` the original name is used instead, in the directory that contains `OUTPUT`.
@@ -136,8 +137,8 @@ For Bit2Vid v1 compatibility, passwords can only contain Latin-1 characters (for
 
 ## Size, duration and disk space
 
-- **Capacity:** at the defaults one frame carries 4,050 bytes, of which about 3,030 are file data after error correction. That is roughly 91 KB per second of video, or about 3.3 hours of video per GiB. 1 MiB takes 346 frames (11.5 s).
-- **MP4 size:** random or compressed data hardly compresses in H.264, so the MP4 ends up several times larger than the input. For example, 1 MiB of random data produced a 7.6 MB MP4 at the defaults. Use `estimate` for the duration, not the file size.
+- **Capacity:** by default each cell stores 4 bits (one of 16 brightness levels) instead of a single black/white bit, so at the defaults one frame carries 16,200 bytes, of which about 12,000 are file data after error correction. That is roughly 350 KB per second of video, or about 50 minutes of video per GiB. 1 MiB takes 83 frames (2.8 s). Pass `--v1` to use the old 1-bit layout (4,050 bytes per frame) at a 4× longer video.
+- **MP4 size:** random or compressed data hardly compresses in H.264, so the MP4 is larger than the input. With 16 levels per cell the same data is spread over 4× fewer frames, which typically brings the MP4 close to the input size instead of several times larger (for example, 1 MiB of random data produced a 7.6 MB MP4 in the 1-bit layout versus about 2 MB now). Use `estimate` for the duration, not the file size.
 - **File size limit:** a single file must be just under 64 GiB (the AES-GCM limit of Bit2Vid v1).
 - **Disk space:** `encode` stages the ciphertext in a temporary file in the output directory, because Bit2Vid stores the authentication tag before the ciphertext. Budget about the input size for that, plus the MP4 itself. `decode` stages the restored file in the output directory before publishing it.
 - **Speed:** encoding uses a hardware GPU encoder when one is available (see [GPU acceleration](#gpu-acceleration)); otherwise x264 at the default `slow` preset dominates encoding time. `--preset veryfast` is faster at the cost of a different size/quality trade-off; verify the result with a round trip. Error correction runs in parallel and uses AVX2 on x86-64 when available, with a portable fallback.
@@ -152,6 +153,7 @@ For Bit2Vid v1 compatibility, passwords can only contain Latin-1 characters (for
 | Linux | VA-API (`/dev/dri/renderD128`), NVENC, Quick Sync | `vaapi`, `nvenc`, `qsv` |
 | macOS | VideoToolbox | `video-toolbox` |
 
+- Hybrid laptops: when a discrete GPU is detected (any NVIDIA card, Intel Arc, or an AMD Radeon RX model), its encoder is tried before the integrated GPU's.
 - A GPU is never required: without a working hardware encoder, or with `--gpu off`, the video is encoded on the CPU with `libx264`. FFmpeg still needs `libx264` for that fallback path.
 - A specific `--gpu` value forces that backend and fails if it is not available in your FFmpeg build or its trial encode fails.
 - The GPU encoder is used for encoding only; decoding always runs on the CPU.
@@ -164,7 +166,7 @@ For Bit2Vid v1 compatibility, passwords can only contain Latin-1 characters (for
 - **Error correction:** Reed-Solomon (255 bytes per codeword) repairs up to half the parity count in corrupted bytes per codeword, which is 32 bytes at the default of 64. It repairs damaged pixels, not missing frames.
 - **The video is not a backup:** cropping, scaling, trimming, dropped frames or heavy re-encoding (for example by a video platform) can make recovery impossible. Keep the original file.
 - **Encryption:** AES-256-GCM with a key from PBKDF2-HMAC-SHA256 (600,000 iterations by default) and a random salt and nonce per file. The original filename is encrypted along with the data. A wrong password or a damaged video fails authentication, and no output is written.
-- **What is not hidden:** the video visibly shows black and white blocks, and its length reveals the approximate file size.
+- **What is not hidden:** the video visibly shows black, white and grey blocks, and its length reveals the approximate file size.
 
 ## Build from source
 
