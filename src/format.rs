@@ -19,15 +19,20 @@ pub struct Grid {
 
 impl Grid {
     pub fn validate(self) -> Result<Self> {
+        self.validate_layout()?;
+        ensure!(
+            self.bits() >= TRANSPORT_SIZE * 8,
+            "frame too small for the Bit2Vid header; increase the resolution or reduce the block size"
+        );
+        Ok(self)
+    }
+
+    pub fn validate_layout(self) -> Result<Self> {
         validate_resolution(self.width, self.height)?;
         ensure!(BLOCK_SIZES.contains(&self.block), "unsupported block size");
         ensure!(
             self.width.is_multiple_of(self.block) && self.height.is_multiple_of(self.block),
             "width and height must be divisible by the block size"
-        );
-        ensure!(
-            self.bits() >= TRANSPORT_SIZE * 8,
-            "frame too small for the Bit2Vid header; increase the resolution or reduce the block size"
         );
         Ok(self)
     }
@@ -61,10 +66,38 @@ pub fn u64_at(data: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(data[at..at + 8].try_into().unwrap())
 }
 
-pub fn transport(grid: Grid, parity: usize, protected: u64, cell_bits: u8) -> [u8; TRANSPORT_SIZE] {
+/// The video stores one cell per pixel at cell resolution instead of a full
+/// resolution frame with block-scaled cells; the decoder upscales geometry.
+pub const VIDEO_MIN_DIMENSION: usize = 256;
+
+/// H.264 with yuv420p needs even video dimensions, and every hardware
+/// encoder supports at least 256x256.
+pub fn video_dimension(cells: usize) -> usize {
+    cells.max(VIDEO_MIN_DIMENSION).next_multiple_of(2)
+}
+
+/// Parsed and majority-voted first bytes of the transport header.
+pub struct Transport {
+    pub width: usize,
+    pub height: usize,
+    pub block: usize,
+    pub parity: usize,
+    pub protected: u64,
+    pub cell_bits: u8,
+    pub compact: bool,
+}
+
+pub fn transport(
+    grid: Grid,
+    parity: usize,
+    protected: u64,
+    cell_bits: u8,
+    compact: bool,
+) -> [u8; TRANSPORT_SIZE] {
     let mut header = [0u8; 64];
     header[..8].copy_from_slice(b"CFVID001");
     header[8] = cell_bits;
+    header[9] = u8::from(compact);
     for (i, n) in [grid.width, grid.height, grid.block, parity]
         .into_iter()
         .enumerate()
@@ -80,7 +113,7 @@ pub fn transport(grid: Grid, parity: usize, protected: u64, cell_bits: u8) -> [u
     out
 }
 
-pub fn parse_transport(data: &[u8], grid: Grid) -> Result<(usize, u64, u8)> {
+pub fn parse_transport(data: &[u8]) -> Result<Transport> {
     let mut vote = [0u8; 28];
     for (i, cell) in vote.iter_mut().enumerate() {
         for bit in 0..8 {
@@ -103,12 +136,11 @@ pub fn parse_transport(data: &[u8], grid: Grid) -> Result<(usize, u64, u8)> {
         cell_bits == 1 || cell_bits == 4,
         "unsupported cell width in the transport header"
     );
-    ensure!(
-        usize::from(u16_at(&vote, 12)) == grid.width
-            && usize::from(u16_at(&vote, 14)) == grid.height
-            && usize::from(u16_at(&vote, 16)) == grid.block,
-        "transport header dimensions do not match the video"
-    );
+    let compact = vote[9] == 1;
+    ensure!(vote[9] == 0 || compact, "unsupported transport mode");
+    let width = usize::from(u16_at(&vote, 12));
+    let height = usize::from(u16_at(&vote, 14));
+    let block = usize::from(u16_at(&vote, 16));
     let parity = usize::from(u16_at(&vote, 18));
     ensure!(
         (1..=127).contains(&parity),
@@ -119,7 +151,15 @@ pub fn parse_transport(data: &[u8], grid: Grid) -> Result<(usize, u64, u8)> {
         protected > ECC_SIZE as u64 && (protected - ECC_SIZE as u64).is_multiple_of(255),
         "invalid protected payload length"
     );
-    Ok((parity, protected, cell_bits))
+    Ok(Transport {
+        width,
+        height,
+        block,
+        parity,
+        protected,
+        cell_bits,
+        compact,
+    })
 }
 
 pub struct Layout {

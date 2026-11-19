@@ -7,7 +7,7 @@ mod video;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use format::{CRYPTO_SIZE, ECC_SIZE, Grid, Layout, MAX_KDF, TRANSPORT_SIZE};
+use format::{CRYPTO_SIZE, ECC_SIZE, Grid, Layout, MAX_KDF, TRANSPORT_SIZE, video_dimension};
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -167,7 +167,7 @@ struct Encoding {
 
 impl Encoding {
     fn resolve(self) -> Result<(video::Settings, usize, u32)> {
-        let grid = Grid {
+        let display = Grid {
             width: self.width,
             height: self.height,
             block: self.block_size,
@@ -179,13 +179,30 @@ impl Encoding {
             Some(Profile::Medium) => (30, "slower", 32),
             Some(Profile::High) => (38, "veryslow", 16),
         };
+        // Compact mode stores one cell per video pixel at cell resolution;
+        // the padded cells carry stream data just like any other cell.
+        let (grid, cell_bits, compact) = if self.v1 {
+            (display, 1, false)
+        } else {
+            (
+                Grid {
+                    width: video_dimension(display.width / display.block),
+                    height: video_dimension(display.height / display.block),
+                    block: 1,
+                },
+                4,
+                true,
+            )
+        };
         Ok((
             video::Settings {
                 grid,
+                display,
                 fps: self.fps,
                 crf: self.crf.unwrap_or(crf),
                 preset: self.preset.unwrap_or_else(|| preset.to_owned()),
-                cell_bits: if self.v1 { 1 } else { 4 },
+                cell_bits,
+                compact,
             },
             self.ecc_symbols.map_or(parity, usize::from),
             self.pbkdf2_iterations,
@@ -290,10 +307,11 @@ fn encode(
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
     let mut sink = video::Sink::new(pipe, settings.grid, settings.cell_bits, frames);
     sink.push(&format::transport(
-        settings.grid,
+        settings.display,
         parity,
         layout.protected,
         settings.cell_bits,
+        settings.compact,
     ))?;
     sink.push(&layout.ecc_header(parity))?;
     ecc::Codec::new(parity).encode(encrypted, layout.encrypted, |data| sink.push(data))?;
@@ -362,14 +380,6 @@ fn decode(
     } else {
         tools.dimensions(input)?
     };
-    if let Some(block) = options.block {
-        Grid {
-            width,
-            height,
-            block,
-        }
-        .validate()?;
-    }
     let mut process = tools.decode(input)?;
     let pipe = process
         .child
@@ -380,14 +390,7 @@ fn decode(
     let mut ecc_header = [0; ECC_SIZE];
     frames.read_exact(&mut ecc_header)?;
     let layout = Layout::parse(&ecc_header, parity, protected)?;
-    frames.set_frames(layout.frames(
-        Grid {
-            width,
-            height,
-            block: frames.block(),
-        },
-        frames.cell_bits(),
-    ));
+    frames.set_frames(layout.frames(frames.grid(), frames.cell_bits()));
     let codec = ecc::Codec::new(parity);
     let mut reader = codec.reader(&mut frames, layout.encrypted);
     let mut header = [0; CRYPTO_SIZE];
@@ -447,8 +450,14 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
     );
     println!(
         "Grid:             {}x{} pixels, {} pixels/block",
-        settings.grid.width, settings.grid.height, settings.grid.block
+        settings.display.width, settings.display.height, settings.display.block
     );
+    if settings.compact {
+        println!(
+            "Video:            {}x{} pixels, one cell per pixel",
+            settings.grid.width, settings.grid.height
+        );
+    }
     println!(
         "Cell depth:       {} luma levels per cell",
         1 << settings.cell_bits
