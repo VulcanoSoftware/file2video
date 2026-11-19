@@ -139,6 +139,7 @@ For Bit2Vid v1 compatibility, passwords can only contain Latin-1 characters (for
 - The GPU encoder is used for encoding only; decoding always runs on the CPU.
 - `--crf` and `--preset` are translated per backend: constant QP on AMF and VA-API, `-cq` on NVENC, ICQ quality on Quick Sync, and a quality setting on VideoToolbox. The presets map to each encoder's speed levels.
 - Verify the result with a round trip (`encode`, then `decode`, then compare hashes), especially when you use non-default `--crf`, `--preset` or `--compress` settings.
+- Troubleshooting: when every backend fails, each one prints its FFmpeg trial error (for example `AMF_NO_DLL` means the AMD Adrenalin driver is missing or too old). Update the GPU driver and run again; use `--gpu off` to encode on the CPU without diagnostics.
 
 ## Reliability and security
 
