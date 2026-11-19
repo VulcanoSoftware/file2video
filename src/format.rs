@@ -61,9 +61,10 @@ pub fn u64_at(data: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(data[at..at + 8].try_into().unwrap())
 }
 
-pub fn transport(grid: Grid, parity: usize, protected: u64) -> [u8; TRANSPORT_SIZE] {
+pub fn transport(grid: Grid, parity: usize, protected: u64, cell_bits: u8) -> [u8; TRANSPORT_SIZE] {
     let mut header = [0u8; 64];
-    header[..9].copy_from_slice(b"CFVID001\x01");
+    header[..8].copy_from_slice(b"CFVID001");
+    header[8] = cell_bits;
     for (i, n) in [grid.width, grid.height, grid.block, parity]
         .into_iter()
         .enumerate()
@@ -79,7 +80,7 @@ pub fn transport(grid: Grid, parity: usize, protected: u64) -> [u8; TRANSPORT_SI
     out
 }
 
-pub fn parse_transport(data: &[u8], grid: Grid) -> Result<(usize, u64)> {
+pub fn parse_transport(data: &[u8], grid: Grid) -> Result<(usize, u64, u8)> {
     let mut vote = [0u8; 28];
     for (i, cell) in vote.iter_mut().enumerate() {
         for bit in 0..8 {
@@ -96,7 +97,12 @@ pub fn parse_transport(data: &[u8], grid: Grid) -> Result<(usize, u64)> {
             }
         }
     }
-    ensure!(&vote[..9] == b"CFVID001\x01", "not a Bit2Vid v1 header");
+    ensure!(&vote[..8] == b"CFVID001", "not a Bit2Vid v1 header");
+    let cell_bits = vote[8];
+    ensure!(
+        cell_bits == 1 || cell_bits == 4,
+        "unsupported cell width in the transport header"
+    );
     ensure!(
         usize::from(u16_at(&vote, 12)) == grid.width
             && usize::from(u16_at(&vote, 14)) == grid.height
@@ -113,7 +119,7 @@ pub fn parse_transport(data: &[u8], grid: Grid) -> Result<(usize, u64)> {
         protected > ECC_SIZE as u64 && (protected - ECC_SIZE as u64).is_multiple_of(255),
         "invalid protected payload length"
     );
-    Ok((parity, protected))
+    Ok((parity, protected, cell_bits))
 }
 
 pub struct Layout {
@@ -137,8 +143,9 @@ impl Layout {
         })
     }
 
-    pub fn frames(&self, grid: Grid) -> u64 {
-        ((TRANSPORT_SIZE as u64 + self.protected) * 8).div_ceil(grid.bits() as u64)
+    pub fn frames(&self, grid: Grid, cell_bits: u8) -> u64 {
+        ((TRANSPORT_SIZE as u64 + self.protected) * 8)
+            .div_ceil(grid.bits() as u64 * u64::from(cell_bits))
     }
 
     pub fn ecc_header(&self, parity: usize) -> [u8; ECC_SIZE] {

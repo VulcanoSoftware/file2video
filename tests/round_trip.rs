@@ -96,6 +96,46 @@ fn round_trip_non_aligned_frames_and_multiple_crypto_chunks() {
 }
 
 #[test]
+fn round_trip_v1_bit_cells() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let data: Vec<u8> = (0..22_237u32).map(|i| (i * 7) as u8).collect();
+    fs::write(dir.join("small.bin"), &data).unwrap();
+    fs::write(dir.join("password.txt"), "mot de passe\n").unwrap();
+
+    success(cli(
+        dir,
+        &[
+            "encode",
+            "small.bin",
+            "v1.mp4",
+            "--width",
+            "648",
+            "--height",
+            "360",
+            "--preset",
+            "ultrafast",
+            "--v1",
+            "--password-file",
+            "password.txt",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    ));
+    success(cli(
+        dir,
+        &[
+            "decode",
+            "v1.mp4",
+            "restored.bin",
+            "--password-file",
+            "password.txt",
+        ],
+    ));
+    assert_eq!(fs::read(dir.join("restored.bin")).unwrap(), data);
+}
+
+#[test]
 fn empty_file_and_truncated_video() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
