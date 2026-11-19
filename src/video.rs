@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
+// The default CRF loses dozens of single-pixel luma levels per frame; crf 10
+// keeps the residual cell noise far below the Reed-Solomon correction budget
+// while still letting the encoder do most of the compression work.
+const COMPACT_MAX_CRF: u8 = 10;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Gpu {
     /// Pick the first working hardware encoder, or fall back to CPU.
@@ -204,12 +209,29 @@ impl Tools {
 
     pub fn encode(&self, settings: &Settings, output: &Path) -> Result<Process> {
         let grid = settings.grid;
-        let small = format!("{}x{}", grid.width / grid.block, grid.height / grid.block);
-        let scale = format!(
-            "scale={}:{}:flags=neighbor,setsar=1",
-            grid.width, grid.height
-        );
-        let encoder = self.select_encoder(settings.crf)?;
+        let small = if settings.compact {
+            format!("{}x{}", grid.width, grid.height)
+        } else {
+            format!("{}x{}", grid.width / grid.block, grid.height / grid.block)
+        };
+        let scale = if settings.compact {
+            "null".to_owned()
+        } else {
+            format!(
+                "scale={}:{}:flags=neighbor,setsar=1",
+                grid.width, grid.height
+            )
+        };
+        // One cell is one video pixel; even sparse quantization noise breaks
+        // a cell value, so compact mode caps every quality setting at a level
+        // whose Reed-Solomon overhead stays comfortably below the correction
+        // capacity of the frame, regardless of what the caller passed.
+        let crf = if settings.compact {
+            settings.crf.min(COMPACT_MAX_CRF)
+        } else {
+            settings.crf
+        };
+        let encoder = self.select_encoder(crf)?;
         let mut cmd = self.command();
         if let Encoder::Gpu(backend) = encoder {
             for arg in backend.device_args() {
@@ -240,14 +262,14 @@ impl Tools {
             Encoder::Cpu => {
                 cmd.arg(&scale)
                     .args(["-c:v", "libx264", "-preset", &settings.preset])
-                    .args(["-crf", &settings.crf.to_string()])
+                    .args(["-crf", &crf.to_string()])
                     .args(["-threads:v", &self.threads.to_string()])
                     .args(["-pix_fmt", "yuv420p", "-f", "mp4"]);
             }
             Encoder::Gpu(backend) => {
                 cmd.arg(backend.filter_chain(&scale))
                     .args(["-c:v", backend.encoder_name()]);
-                quality = backend.quality_args(settings.crf, &settings.preset);
+                quality = backend.quality_args(crf, &settings.preset);
                 cmd.args(&quality);
                 if backend.passes_pix_fmt() {
                     cmd.args(["-pix_fmt", "yuv420p"]);
@@ -537,12 +559,18 @@ fn frame_sync_for(version_line: &str) -> [&'static str; 2] {
 }
 
 pub struct Settings {
+    /// The cell grid: one cell per frame fed to FFmpeg. In compact mode a
+    /// cell is one video pixel; otherwise a cell is a grid.block pixel square.
     pub grid: Grid,
+    /// The nominal grid stored in the transport header.
+    pub display: Grid,
     pub fps: u8,
     pub crf: u8,
     pub preset: String,
     /// Luma levels per cell: 1 (Bit2Vid v1, black/white) or 4 (16 levels).
     pub cell_bits: u8,
+    /// Store the video at cell resolution instead of full resolution.
+    pub compact: bool,
 }
 
 pub struct Process {
@@ -747,6 +775,7 @@ type Packer = fn(&[u8]) -> u8;
 fn sampler(block: usize, cell_bits: u8) -> Sampler {
     match cell_bits {
         1 => match block {
+            1 => sample::<1>,
             8 => sample::<8>,
             10 => sample::<10>,
             12 => sample::<12>,
@@ -755,6 +784,7 @@ fn sampler(block: usize, cell_bits: u8) -> Sampler {
             _ => unreachable!(),
         },
         _ => match block {
+            1 => sample4::<1>,
             8 => sample4::<8>,
             10 => sample4::<10>,
             12 => sample4::<12>,
@@ -829,6 +859,7 @@ pub struct Source<R> {
     sampler: Sampler,
     packer: Packer,
     cell_bits: u8,
+    compact: bool,
     read: u64,
     bytes: u64,
     progress: Progress,
@@ -866,8 +897,12 @@ impl<R: Read> Source<R> {
                 for (byte, unit) in head.iter_mut().zip(cells.chunks_exact(units)) {
                     *byte = packer(cell_bits)(unit);
                 }
-                if let Ok((parity, len, header_bits)) = parse_transport(&head, grid)
-                    && header_bits == cell_bits
+                if let Ok(header) = parse_transport(&head)
+                    && !header.compact
+                    && header.width == width
+                    && header.height == height
+                    && header.block == block
+                    && header.cell_bits == cell_bits
                 {
                     return Ok((
                         Self {
@@ -879,12 +914,49 @@ impl<R: Read> Source<R> {
                             sampler: sample,
                             packer: packer(cell_bits),
                             cell_bits,
+                            compact: false,
                             read: 1,
                             bytes: 0,
                             progress: Progress::new("Decode", 1),
                         },
-                        parity,
-                        len,
+                        header.parity,
+                        header.protected,
+                    ));
+                }
+            }
+            if width * height >= TRANSPORT_SIZE * units {
+                let sample = sampler(1, cell_bits);
+                let grid = Grid {
+                    width,
+                    height,
+                    block: 1,
+                };
+                let mut cells = vec![0u8; grid.bits()];
+                sample(&image, grid, &mut cells);
+                for (byte, unit) in head.iter_mut().zip(cells.chunks_exact(units)) {
+                    *byte = packer(cell_bits)(unit);
+                }
+                if let Ok(header) = parse_transport(&head)
+                    && header.compact
+                    && header.cell_bits == cell_bits
+                {
+                    return Ok((
+                        Self {
+                            pipe,
+                            image,
+                            units: cells,
+                            pos: TRANSPORT_SIZE * units,
+                            grid,
+                            sampler: sample,
+                            packer: packer(cell_bits),
+                            cell_bits,
+                            compact: true,
+                            read: 1,
+                            bytes: 0,
+                            progress: Progress::new("Decode", 1),
+                        },
+                        header.parity,
+                        header.protected,
                     ));
                 }
             }
@@ -896,12 +968,16 @@ impl<R: Read> Source<R> {
         self.progress.total = expected;
     }
 
-    pub fn block(&self) -> usize {
-        self.grid.block
+    pub fn grid(&self) -> Grid {
+        self.grid
     }
 
     pub fn cell_bits(&self) -> u8 {
         self.cell_bits
+    }
+
+    pub fn compact(&self) -> bool {
+        self.compact
     }
 
     fn next_frame(&mut self) -> io::Result<()> {
@@ -1020,7 +1096,7 @@ mod tests {
             let mut raw = Vec::new();
             {
                 let mut sink = Sink::new(&mut raw, grid, cell_bits, 1);
-                sink.push(&format::transport(grid, 64, 285, cell_bits))
+                sink.push(&format::transport(grid, 64, 285, cell_bits, false))
                     .unwrap();
                 sink.push(&[7u8; format::ECC_SIZE]).unwrap();
                 sink.push(&data).unwrap();
@@ -1039,6 +1115,49 @@ mod tests {
             assert_eq!(out, data);
             source.finish().unwrap();
         }
+    }
+
+    #[test]
+    fn round_trips_compact_one_pixel_cells() {
+        let grid = Grid {
+            width: 256,
+            height: 256,
+            block: 1,
+        };
+        let display = Grid {
+            width: 648,
+            height: 360,
+            block: 8,
+        };
+        let mut seed = 0x9e37_79b9u32;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let mut raw = Vec::new();
+        {
+            let mut sink = Sink::new(&mut raw, grid, 4, 1);
+            sink.push(&format::transport(display, 64, 285, 4, true))
+                .unwrap();
+            sink.push(&[7u8; format::ECC_SIZE]).unwrap();
+            sink.push(&data).unwrap();
+            sink.finish().unwrap();
+        }
+        let (mut source, parity, protected) =
+            Source::open(Cursor::new(&raw), 256, 256, None).unwrap();
+        assert_eq!(parity, 64);
+        assert_eq!(protected, 285);
+        assert_eq!(source.cell_bits(), 4);
+        let mut ecc = [0; format::ECC_SIZE];
+        source.read_exact(&mut ecc).unwrap();
+        let mut out = vec![0; data.len()];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, data);
+        source.finish().unwrap();
     }
 
     #[test]

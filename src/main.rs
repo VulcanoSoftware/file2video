@@ -7,7 +7,7 @@ mod video;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use format::{CRYPTO_SIZE, ECC_SIZE, Grid, Layout, MAX_KDF, TRANSPORT_SIZE};
+use format::{CRYPTO_SIZE, ECC_SIZE, Grid, Layout, MAX_KDF, TRANSPORT_SIZE, video_dimension};
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -148,7 +148,7 @@ struct Encoding {
     /// Use a smaller-output Bit2Vid profile (can reduce recovery margin).
     #[arg(long, value_enum)]
     compress: Option<Profile>,
-    /// x264 quality (default: 18, or set by --compress).
+    /// x264 quality (default: 18, or set by --compress; capped at 10 in default compact mode so cell data survives).
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
     crf: Option<u8>,
     /// x264 speed/size preset (default: slow, or set by --compress).
@@ -167,7 +167,7 @@ struct Encoding {
 
 impl Encoding {
     fn resolve(self) -> Result<(video::Settings, usize, u32)> {
-        let grid = Grid {
+        let display = Grid {
             width: self.width,
             height: self.height,
             block: self.block_size,
@@ -179,13 +179,30 @@ impl Encoding {
             Some(Profile::Medium) => (30, "slower", 32),
             Some(Profile::High) => (38, "veryslow", 16),
         };
+        // Compact mode stores one cell per video pixel at cell resolution;
+        // the padded cells carry stream data just like any other cell.
+        let (grid, cell_bits, compact) = if self.v1 {
+            (display, 1, false)
+        } else {
+            (
+                Grid {
+                    width: video_dimension(display.width / display.block),
+                    height: video_dimension(display.height / display.block),
+                    block: 1,
+                },
+                4,
+                true,
+            )
+        };
         Ok((
             video::Settings {
                 grid,
+                display,
                 fps: self.fps,
                 crf: self.crf.unwrap_or(crf),
                 preset: self.preset.unwrap_or_else(|| preset.to_owned()),
-                cell_bits: if self.v1 { 1 } else { 4 },
+                cell_bits,
+                compact,
             },
             self.ecc_symbols.map_or(parity, usize::from),
             self.pbkdf2_iterations,
@@ -242,7 +259,12 @@ fn encode(
         .checked_add(metadata.len() as u64)
         .context("input size overflow")?;
     let mut header = crypto::Header::new(iterations, plain_size)?;
-    let layout = Layout::new(plain_size + CRYPTO_SIZE as u64, parity)?;
+    let encrypted_size = plain_size + CRYPTO_SIZE as u64;
+    let layout = if settings.compact {
+        Layout::compact(encrypted_size, parity)?
+    } else {
+        Layout::new(encrypted_size, parity)?
+    };
     let password = password.get(true)?;
     let mut crypto = crypto::Stream::new(&header, &password);
     drop(password);
@@ -290,13 +312,26 @@ fn encode(
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
     let mut sink = video::Sink::new(pipe, settings.grid, settings.cell_bits, frames);
     sink.push(&format::transport(
-        settings.grid,
+        settings.display,
         parity,
         layout.protected,
         settings.cell_bits,
+        settings.compact,
     ))?;
-    sink.push(&layout.ecc_header(parity))?;
-    ecc::Codec::new(parity).encode(encrypted, layout.encrypted, |data| sink.push(data))?;
+    let codec = ecc::Codec::new(parity);
+    if settings.compact {
+        // In compact mode the ECC header leads the first Reed-Solomon word's
+        // data, so parity protects it against quantization noise too.
+        let ecc_header = layout.ecc_header(parity);
+        codec.encode(
+            ecc_header.as_slice().chain(encrypted),
+            ECC_SIZE as u64 + layout.encrypted,
+            |data| sink.push(data),
+        )?;
+    } else {
+        sink.push(&layout.ecc_header(parity))?;
+        codec.encode(encrypted, layout.encrypted, |data| sink.push(data))?;
+    }
     sink.finish()?;
     process.finish()?;
     publish(tmp, output)
@@ -362,14 +397,6 @@ fn decode(
     } else {
         tools.dimensions(input)?
     };
-    if let Some(block) = options.block {
-        Grid {
-            width,
-            height,
-            block,
-        }
-        .validate()?;
-    }
     let mut process = tools.decode(input)?;
     let pipe = process
         .child
@@ -377,19 +404,26 @@ fn decode(
         .take()
         .context("missing FFmpeg stdout")?;
     let (mut frames, parity, protected) = video::Source::open(pipe, width, height, options.block)?;
-    let mut ecc_header = [0; ECC_SIZE];
-    frames.read_exact(&mut ecc_header)?;
-    let layout = Layout::parse(&ecc_header, parity, protected)?;
-    frames.set_frames(layout.frames(
-        Grid {
-            width,
-            height,
-            block: frames.block(),
-        },
-        frames.cell_bits(),
-    ));
+    let grid = frames.grid();
+    let cell_bits = frames.cell_bits();
     let codec = ecc::Codec::new(parity);
-    let mut reader = codec.reader(&mut frames, layout.encrypted);
+    let mut ecc_header = [0; ECC_SIZE];
+    let (mut reader, layout) = if frames.compact() {
+        // Plain allowance for the codewords: words carry 255 - parity data
+        // bytes each, which is all the encoder ever wrote.
+        let words = (protected - ECC_SIZE as u64) / 255;
+        let mut stream = codec.reader(&mut frames, words * (255 - parity) as u64);
+        stream.read_exact(&mut ecc_header)?;
+        let layout = Layout::parse(&ecc_header, parity, protected, true)?;
+        (stream, layout)
+    } else {
+        frames.read_exact(&mut ecc_header)?;
+        let layout = Layout::parse(&ecc_header, parity, protected, false)?;
+        (codec.reader(&mut frames, layout.encrypted), layout)
+    };
+    reader
+        .input_mut()
+        .set_frames(layout.frames(grid, cell_bits));
     let mut header = [0; CRYPTO_SIZE];
     reader.read_exact(&mut header)?;
     let header = crypto::Header::parse(&header, layout.encrypted - CRYPTO_SIZE as u64)?;
@@ -437,7 +471,11 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
     let encrypted = size
         .checked_add(metadata + CRYPTO_SIZE as u64)
         .context("input size overflow")?;
-    let layout = Layout::new(encrypted, parity)?;
+    let layout = if settings.compact {
+        Layout::compact(encrypted, parity)?
+    } else {
+        Layout::new(encrypted, parity)?
+    };
     let frames = layout.frames(settings.grid, settings.cell_bits);
     println!("Input:            {size} bytes");
     println!("Encrypted:        {} bytes", layout.encrypted);
@@ -447,8 +485,14 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
     );
     println!(
         "Grid:             {}x{} pixels, {} pixels/block",
-        settings.grid.width, settings.grid.height, settings.grid.block
+        settings.display.width, settings.display.height, settings.display.block
     );
+    if settings.compact {
+        println!(
+            "Video:            {}x{} pixels, one cell per pixel",
+            settings.grid.width, settings.grid.height
+        );
+    }
     println!(
         "Cell depth:       {} luma levels per cell",
         1 << settings.cell_bits
