@@ -7,7 +7,7 @@ Command-line tool that turns any file into an encrypted H.264 MP4 video and rest
 ## Requirements
 
 - A prebuilt binary from [GitHub Releases](https://github.com/VulcanoSoftware/file2video/releases) (no Rust or Python needed).
-- FFmpeg with `libx264`, plus `ffprobe` — downloaded automatically on first use when it is missing (see [FFmpeg auto-download](#ffmpeg-auto-download)), or installed manually:
+- [FFmpeg](https://ffmpeg.org/download.html) with `libx264`, plus `ffprobe` — downloaded automatically on first use when it is missing (see [FFmpeg auto-download](#ffmpeg-auto-download)), or installed manually. A GPU with a hardware H.264 encoder is used automatically when available (for example, an AMD GPU on Windows uses AMF).
 
 | Platform | Manual install |
 | --- | --- |
@@ -107,6 +107,7 @@ Prints the exact encrypted size, frame count and playback duration for a file, w
 | `--ffmpeg <PATH>` | FFmpeg executable (default: from `PATH`, auto-downloaded when missing). |
 | `--no-download` | Never download FFmpeg; use what is already on the system. |
 | `--ffprobe <PATH>` | ffprobe executable (default: next to FFmpeg, else `PATH`). |
+| `--gpu <MODE>` | Hardware encoder for `encode`: `auto` (default), `off`, `amf`, `nvenc`, `qsv`, `vaapi`, `video-toolbox`. See [GPU acceleration](#gpu-acceleration). |
 | `--threads <N>` | Thread limit for the Rust error-correction pool and for FFmpeg (`0` = automatic). |
 
 ## Passwords
@@ -121,7 +122,23 @@ For Bit2Vid v1 compatibility, passwords can only contain Latin-1 characters (for
 - **MP4 size:** random or compressed data hardly compresses in H.264, so the MP4 ends up several times larger than the input. For example, 1 MiB of random data produced a 7.6 MB MP4 at the defaults. Use `estimate` for the duration, not the file size.
 - **File size limit:** a single file must be just under 64 GiB (the AES-GCM limit of Bit2Vid v1).
 - **Disk space:** `encode` stages the ciphertext in a temporary file in the output directory, because Bit2Vid stores the authentication tag before the ciphertext. Budget about the input size for that, plus the MP4 itself. `decode` stages the restored file in the output directory before publishing it.
-- **Speed:** x264 at the default `slow` preset dominates encoding time. `--preset veryfast` is faster at the cost of a different size/quality trade-off; verify the result with a round trip. Error correction runs in parallel and uses AVX2 on x86-64 when available, with a portable fallback. No GPU is used.
+- **Speed:** encoding uses a hardware GPU encoder when one is available (see [GPU acceleration](#gpu-acceleration)); otherwise x264 at the default `slow` preset dominates encoding time. `--preset veryfast` is faster at the cost of a different size/quality trade-off; verify the result with a round trip. Error correction runs in parallel and uses AVX2 on x86-64 when available, with a portable fallback.
+
+## GPU acceleration
+
+`encode` uses the hardware H.264 encoder on your GPU by default. A small trial encode checks each candidate in order and the first working one is used; if none works, a notice is printed and the video is encoded on the CPU with `libx264` as before.
+
+| System | Backends tried in order | Values for `--gpu` |
+| --- | --- | --- |
+| Windows | AMF (AMD), NVENC (NVIDIA), Quick Sync (Intel) | `amf`, `nvenc`, `qsv` |
+| Linux | VA-API (`/dev/dri/renderD128`), NVENC, Quick Sync | `vaapi`, `nvenc`, `qsv` |
+| macOS | VideoToolbox | `video-toolbox` |
+
+- A GPU is never required: without a working hardware encoder, or with `--gpu off`, the video is encoded on the CPU with `libx264`. FFmpeg still needs `libx264` for that fallback path.
+- A specific `--gpu` value forces that backend and fails if it is not available in your FFmpeg build or its trial encode fails.
+- The GPU encoder is used for encoding only; decoding always runs on the CPU.
+- `--crf` and `--preset` are translated per backend: constant QP on AMF and VA-API, `-cq` on NVENC, ICQ quality on Quick Sync, and a quality setting on VideoToolbox. The presets map to each encoder's speed levels.
+- Verify the result with a round trip (`encode`, then `decode`, then compare hashes), especially when you use non-default `--crf`, `--preset` or `--compress` settings.
 
 ## Reliability and security
 

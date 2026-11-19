@@ -41,6 +41,9 @@ struct Cli {
     /// Thread limit for each of the Rust ECC pool and FFmpeg (0 = automatic).
     #[arg(long, global = true, default_value_t = 0)]
     threads: usize,
+    /// Hardware encoder for the video (auto/off/amf/nvenc/qsv/vaapi/video-toolbox).
+    #[arg(long, global = true, value_enum, default_value_t = video::Gpu::Auto)]
+    gpu: video::Gpu,
     /// Do not download a full FFmpeg build automatically (default: download when missing).
     #[arg(long, global = true)]
     no_download: bool,
@@ -453,7 +456,9 @@ fn pick_ffmpeg(cli: &Cli) -> PathBuf {
     if cli.no_download || !uses_video(cli) {
         return default;
     }
-    if download::ffmpeg_works(&default) && download::has_hardware_encoders(&default) {
+    let full_build = download::ffmpeg_works(&default)
+        && (cli.gpu == video::Gpu::Off || download::has_hardware_encoders(&default));
+    if full_build {
         return default;
     }
     match download::install() {
@@ -472,6 +477,7 @@ fn run() -> Result<()> {
         ffmpeg: pick_ffmpeg(&cli),
         ffprobe: cli.ffprobe,
         threads: cli.threads,
+        gpu: cli.gpu,
     };
     if cli.threads != 0 {
         rayon::ThreadPoolBuilder::new()
