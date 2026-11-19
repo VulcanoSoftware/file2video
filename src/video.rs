@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Gpu {
     /// Pick the first working hardware encoder, or fall back to CPU.
     Auto,
@@ -47,6 +47,34 @@ impl Gpu {
         } else {
             &[Self::Vaapi, Self::Nvenc, Self::Qsv]
         }
+    }
+
+    // On hybrid-laptop GPUs (an integrated GPU plus a discrete one) the
+    // discrete GPU is usually much faster, so put its vendor's backend first
+    // when the OS reports such a card.
+    pub fn prioritized_candidates(gpus: &[String]) -> Vec<Self> {
+        let mut candidates = Self::candidates().to_vec();
+        let discrete = gpus.iter().find_map(|name| {
+            let lower = name.to_ascii_lowercase();
+            if lower.contains("nvidia") || lower.contains("geforce") {
+                Some(Self::Nvenc)
+            } else if lower.contains("intel") && lower.contains("arc") {
+                Some(Self::Qsv)
+            } else if (lower.contains("radeon") || lower.contains("amd")) && lower.contains("rx") {
+                Some(Self::Amf)
+            } else {
+                None
+            }
+        });
+        if let Some(index) = discrete.and_then(|preferred| {
+            candidates
+                .iter()
+                .position(|candidate| *candidate == preferred)
+        }) {
+            let preferred = candidates.remove(index);
+            candidates.insert(0, preferred);
+        }
+        candidates
     }
 
     fn device_args(self) -> Vec<String> {
@@ -307,9 +335,21 @@ impl Tools {
         let forced = self.gpu != Gpu::Auto && self.gpu != Gpu::Off;
         let list = self.encoder_list()?;
         let candidates = if forced {
-            std::slice::from_ref(&self.gpu)
+            vec![self.gpu]
         } else {
-            Gpu::candidates()
+            let gpus = crate::diag::gpu_names();
+            let ordered = Gpu::prioritized_candidates(&gpus);
+            if ordered.first() != Gpu::candidates().first() && ordered.len() > 1 {
+                eprintln!(
+                    "Detected a discrete GPU; trying {} first.",
+                    ordered[0].encoder_name()
+                );
+            }
+            if debug() {
+                let names: Vec<&str> = ordered.iter().map(|g| g.encoder_name()).collect();
+                eprintln!("GPU encoder order: {}.", names.join(", "));
+            }
+            ordered
         };
         for backend in candidates {
             let name = backend.encoder_name();
@@ -322,10 +362,10 @@ impl Tools {
                 eprintln!("GPU encoder {name} is not in this FFmpeg build; skipping.");
                 continue;
             }
-            match self.preflight(*backend, crf) {
+            match self.preflight(backend, crf) {
                 Ok(()) => {
                     eprintln!("Encoding with {name} on the GPU.");
-                    return Ok(Encoder::Gpu(*backend));
+                    return Ok(Encoder::Gpu(backend));
                 }
                 Err(reason) if forced => bail!(
                     "{name} failed its trial encode: {reason}\nCheck your GPU driver, or pass --gpu off to encode on the CPU"
@@ -864,6 +904,28 @@ mod tests {
                 ["-fps_mode", "passthrough"]
             );
         }
+    }
+
+    #[test]
+    fn hybrid_laptops_prefer_the_discrete_gpu() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let hybrid = vec![
+            "AMD Radeon(TM) 760M Graphics".to_owned(),
+            "NVIDIA GeForce RTX 4060 Laptop GPU".to_owned(),
+        ];
+        assert_eq!(Gpu::prioritized_candidates(&hybrid)[0], Gpu::Nvenc);
+        assert_eq!(
+            Gpu::prioritized_candidates(&["Intel(R) Arc(TM) Graphics".to_owned()])[0],
+            Gpu::Qsv
+        );
+        let integrated = vec!["AMD Radeon(TM) Graphics".to_owned()];
+        assert_eq!(
+            Gpu::prioritized_candidates(&integrated),
+            Gpu::candidates().to_vec()
+        );
+        assert_eq!(Gpu::prioritized_candidates(&[]), Gpu::candidates().to_vec());
     }
 
     #[test]

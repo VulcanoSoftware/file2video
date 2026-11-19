@@ -152,6 +152,7 @@ For Bit2Vid v1 compatibility, passwords can only contain Latin-1 characters (for
 | Linux | VA-API (`/dev/dri/renderD128`), NVENC, Quick Sync | `vaapi`, `nvenc`, `qsv` |
 | macOS | VideoToolbox | `video-toolbox` |
 
+- Hybrid laptops: when a discrete GPU is detected (any NVIDIA card, Intel Arc, or an AMD Radeon RX model), its encoder is tried before the integrated GPU's.
 - A GPU is never required: without a working hardware encoder, or with `--gpu off`, the video is encoded on the CPU with `libx264`. FFmpeg still needs `libx264` for that fallback path.
 - A specific `--gpu` value forces that backend and fails if it is not available in your FFmpeg build or its trial encode fails.
 - The GPU encoder is used for encoding only; decoding always runs on the CPU.
