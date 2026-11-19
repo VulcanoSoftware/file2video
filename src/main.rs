@@ -1,4 +1,5 @@
 mod crypto;
+mod download;
 mod ecc;
 mod format;
 mod video;
@@ -43,6 +44,9 @@ struct Cli {
     /// Hardware encoder for the video (auto/off/amf/nvenc/qsv/vaapi/video-toolbox).
     #[arg(long, global = true, value_enum, default_value_t = video::Gpu::Auto)]
     gpu: video::Gpu,
+    /// Do not download a full FFmpeg build automatically (default: download when missing).
+    #[arg(long, global = true)]
+    no_download: bool,
 }
 
 #[derive(Subcommand)]
@@ -439,11 +443,38 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
     Ok(())
 }
 
+// The estimate command never touches FFmpeg; encode and decode do.
+fn uses_video(cli: &Cli) -> bool {
+    !matches!(cli.command, Operation::Estimate { .. })
+}
+
+fn pick_ffmpeg(cli: &Cli) -> PathBuf {
+    if let Some(path) = &cli.ffmpeg {
+        return path.clone();
+    }
+    let default = PathBuf::from(video::default_ffmpeg());
+    if cli.no_download || !uses_video(cli) {
+        return default;
+    }
+    let full_build = download::ffmpeg_works(&default)
+        && (cli.gpu == video::Gpu::Off || download::has_hardware_encoders(&default));
+    if full_build {
+        return default;
+    }
+    match download::install() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Warning: {error:#}. Continuing with {}.", default.display());
+            default
+        }
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     ensure!(cli.threads <= 256, "--threads must be in 0..=256");
     let tools = video::Tools {
-        ffmpeg: cli.ffmpeg.unwrap_or_else(|| video::default_ffmpeg().into()),
+        ffmpeg: pick_ffmpeg(&cli),
         ffprobe: cli.ffprobe,
         threads: cli.threads,
         gpu: cli.gpu,
