@@ -140,7 +140,7 @@ How it works:
 
 Limitations:
 
-- `--chroma` (the colour planes carry background colours) and `--optimise` (calibration profiles only cover the cell format) cannot be combined with `--stealth`.
+- `--chroma` (the colour planes carry background colours) cannot be combined with `--stealth`. An explicit `--optimise` on the command line is rejected too (calibration profiles only cover the cell format); an `optimise =` default from the configuration file is ignored with a warning, so a config tuned for cell encodes never blocks a stealth encode.
 - `estimate` and `benchmark` have no stealth support; use them in normal mode only.
 - The 8-byte sync marker and the transport header are outside the Reed-Solomon protection. If the opening frames of the video are damaged so badly that anchors or header cannot be parsed, decoding stops; the file payload itself enjoys the full parity budget.
 - Capacity per frame is much lower than the cell format (a 1920×1080 frame holds ~3.5 KB instead of ~130 KB), so the same file takes far more playback duration in stealth mode — this mode trades capacity for invisibility.

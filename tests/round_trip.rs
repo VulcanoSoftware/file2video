@@ -326,6 +326,10 @@ fn stealth_round_trip_with_looping_background_audio() {
         .collect();
     fs::write(dir.join("payload.bin"), &data).unwrap();
 
+    // A config-level optimise target must not block stealth encodes; the
+    // tool warns and encodes with the requested settings instead.
+    fs::write(dir.join("file2video.conf"), "optimise = smallest\n").unwrap();
+
     // One second of 240x144 background video with an audio track; the data
     // layer needs far more frames than that, so both streams must loop.
     success(
@@ -360,7 +364,7 @@ fn stealth_round_trip_with_looping_background_audio() {
             .output()
             .unwrap(),
     );
-    success(cli(
+    let encoded = cli(
         dir,
         &[
             "encode",
@@ -377,7 +381,37 @@ fn stealth_round_trip_with_looping_background_audio() {
             "--pbkdf2-iterations",
             "1000",
         ],
-    ));
+    );
+    success(encoded.clone());
+    let stderr = String::from_utf8_lossy(&encoded.stderr);
+    assert!(
+        stderr.contains("ignoring the optimise target"),
+        "expected an optimise warning, got: {stderr}"
+    );
+
+    // The explicit flag remains rejected.
+    let rejected = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-2.mp4",
+            "--stealth",
+            "dummy.mp4",
+            "--optimise",
+            "smallest",
+            "--password",
+            "a",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    );
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("cannot be combined with --stealth"),
+        "expected an explicit --optimise rejection, got: {stderr}"
+    );
 
     let probe = Command::new("ffprobe")
         .current_dir(dir)
