@@ -82,6 +82,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--no-password` | off | Store the file without encryption: anyone who downloads the video can read it. A SHA-256 integrity check still protects against damaged videos; decoding never asks for a password. |
 | `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). |
 | `--stealth <VIDEO>` | off | Hide the data as a faint luma layer over a background video instead of storing cells; decoding is blind and does not need that video again. See [Stealth mode](#stealth-mode). |
+| `--stealth-block <PIXELS>` | `6` | Stealth mode only: modulation block size (even, 2–16). Smaller blocks carry more data per frame and encode proportionally faster; see [Stealth mode](#stealth-mode). |
 
 `--compress` sets preset and parity together: `light` = `slow` / 64, `medium` = `slower` / 32, `high` = `veryslow` / 16; CRF stays capped at 8 (6 with `--intra`). Explicit `--crf`, `--preset`, `--chroma`, `--intra` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
 
@@ -131,12 +132,28 @@ With `--stealth <VIDEO>`, `encode` does not store cells at all. Instead it hides
 
 How it works:
 
-- The data layer only touches the **brightness (Y) channel**; the colours (U/V) of the background stay untouched. The frame is divided into rows of 6×6-pixel block pairs; each pair stores one bit by shifting the pair's mean luma towards one block or the other (±25/255, about 10% brightness). Base values are clamped to 30–225 and the shift is applied around the pair's mean, so the bit survives strong background gradients and re-encoding (tested through CRF 18, the default).
+- The data layer only touches the **brightness (Y) channel**; the colours (U/V) of the background stay untouched. The frame is divided into rows of block pairs (6×6 pixels each by default); each pair stores one bit by shifting the pair's mean luma towards one block or the other (±25/255, about 10% brightness). Base values are clamped to 30–225 and the shift is applied around the pair's mean, so the bit survives strong background gradients and re-encoding (tested through CRF 18, the default).
 - A checkerboard anchor pattern along the frame edges lets the decoder align the grid even after scaling or a few dropped frames.
 - The background video is looped (`-stream_loop -1`) for both picture and audio as long as data remains, and its audio is muxed into the output; `-shortest` ends the video with the last data frame.
-- Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each bit by comparing the mean luma of block A versus block B. You never need the background video again.
+- Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each bit by comparing the mean luma of block A versus block B. The stealth block size is detected automatically too — no decoder-side flag is needed. You never need the background video again.
 - Because re-encoded guerrilla data (streaming platforms use VP9/AV1) demands extra robustness, stealth defaults to 96 Reed-Solomon parity symbols per codeword (~38% redundancy) and CRF 18.
-- Dimensions default to the background video's resolution rounded down to a multiple of 6 (the block size); `--width`, `--height`, `--fps`, `--crf`, `--preset`, `--ecc-symbols`, `--intra` and their config-file equivalents override the defaults as usual.
+- Dimensions default to the background video's resolution rounded down to a multiple of the block size; `--width`, `--height`, `--fps`, `--crf`, `--preset`, `--ecc-symbols`, `--intra` and their config-file equivalents override the defaults as usual.
+
+Speed: every bit costs two blocks of pixels, so the block size directly sets the throughput. The default 6 favours robustness; `--stealth-block 4` carries 2.25x as much per frame, and `--stealth-block 2` up to 9x as much. Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; encode wall time is typically a fraction of it on GPU-capable machines, decode the same again):
+
+| Block | Bytes/frame | Playback throughput | Video duration for 1 GiB |
+| --- | --- | --- | --- |
+| 6 (default) | 3,498 | 0.10 MB/s | ~2.8 hours |
+| 4 | 7,946 | 0.24 MB/s | ~1.3 hours |
+| 2 | 32,093 | 0.96 MB/s | ~19 minutes |
+
+For the fastest stealth encodes, combine a small block with a high `--fps` (throughput scales linearly with the frame rate) and keep the background resolution high. Use smaller block sizes when your distribution channel is gentle (direct file transfer, mild re-encoding); keep the default 6 — or larger (`--stealth-block 8` and up) — when the video will be re-encoded aggressively (YouTube, streaming platforms).
+
+Example: encode a 1 GiB archive as a stealth layer at 2.25x the default density:
+
+```sh
+./file2video encode backup.zip hidden.mp4 --stealth gameplay.mp4 --stealth-block 4 --password s3cret
+```
 
 Limitations:
 

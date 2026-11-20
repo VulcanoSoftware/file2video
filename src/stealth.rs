@@ -4,8 +4,9 @@
 //! decoder recovers the file blindly: it never needs the background video.
 //!
 //! Every frame keeps the background's chroma planes untouched and carries
-//! data only in the luma plane. The frame is divided into 6x6 pixel blocks;
-//! horizontally adjacent block pairs store one bit by shifting their means
+//! data only in the luma plane. The frame is divided into square pixel
+//! blocks (6x6 by default, `--stealth-block` overrides it); horizontally
+//! adjacent block pairs store one bit by shifting their means
 //! in opposite directions. A static checkerboard pattern along the frame
 //! border gives the decoder exact grid alignment anchors. Anchors keep the
 //! modulation inside the safe luma range: the background is clamped to
@@ -13,7 +14,8 @@
 
 use crate::ecc;
 use crate::format::{
-    ECC_SIZE, Grid, Layout, TRANSPORT_SIZE, parse_transport, transport, validate_resolution,
+    ECC_SIZE, Grid, Layout, TRANSPORT_SIZE, Transport, parse_transport, transport,
+    validate_resolution,
 };
 use crate::video::{Encoder, Progress, Tools, local_path};
 use anyhow::{Context, Result, ensure};
@@ -23,8 +25,12 @@ use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::NamedTempFile;
 
 /// Pixels per modulation block; every data bit occupies a pair of two
-/// horizontally adjacent blocks.
+/// horizontally adjacent blocks. This is the default; `--stealth-block`
+/// overrides it (smaller blocks carry more data per frame).
 pub const BLOCK: usize = 6;
+/// Even block sizes tried by the blind decoder, in probe order: the default
+/// first, then the faster smaller blocks, then the sturdier larger ones.
+const CANDIDATE_BLOCKS: [usize; 8] = [6, 4, 2, 8, 10, 12, 14, 16];
 /// Luma delta applied to each block of a pair.
 pub const MODULATION: i16 = 25;
 /// The background luma is clamped to this range before modulation.
@@ -47,11 +53,13 @@ const ANCHOR_MARGIN: u32 = 6;
 /// shifted candidate from winning the alignment score.
 const DIFFERENT_SUM_SENTINEL: u64 = 0;
 
-/// Fixed stealth-layer geometry derived from the output resolution.
+/// Fixed stealth-layer geometry derived from the output resolution and the
+/// modulation block size.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub width: usize,
     pub height: usize,
+    pub block: usize,
     columns: usize,
     rows: usize,
     pairs: usize,
@@ -59,14 +67,14 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    pub fn new(width: usize, height: usize) -> Result<Self> {
+    pub fn new(width: usize, height: usize, block: usize) -> Result<Self> {
         validate_resolution(width, height)?;
         ensure!(
-            width.is_multiple_of(BLOCK) && height.is_multiple_of(BLOCK),
-            "the stealth video resolution must be a multiple of {BLOCK} pixels"
+            width.is_multiple_of(block) && height.is_multiple_of(block),
+            "the stealth video resolution must be a multiple of {block} pixels"
         );
-        let columns = width / BLOCK;
-        let rows = height / BLOCK;
+        let columns = width / block;
+        let rows = height / block;
         ensure!(
             rows > ANCHOR_TOP_ROWS + ANCHOR_BOTTOM_ROWS && columns > 2 * ANCHOR_COLS,
             "the video is too small for the stealth anchor border"
@@ -81,6 +89,7 @@ impl Geometry {
         Ok(Self {
             width,
             height,
+            block,
             columns,
             rows,
             pairs,
@@ -118,6 +127,7 @@ impl Geometry {
 pub struct StealthSettings {
     pub width: usize,
     pub height: usize,
+    pub block: usize,
     pub fps: u8,
     pub crf: u8,
     pub preset: String,
@@ -135,20 +145,10 @@ fn anchor_value(col: usize, row: usize) -> u8 {
     }
 }
 
-fn fill_block(
-    image: &mut [u8],
-    width: usize,
-    col: usize,
-    row: usize,
-    dx: usize,
-    dy: usize,
-    value: u8,
-) {
-    let x0 = col * BLOCK + dx;
-    let y0 = row * BLOCK + dy;
-    for y in y0..y0 + BLOCK {
+fn fill_block(image: &mut [u8], block: usize, width: usize, x0: usize, y0: usize, value: u8) {
+    for y in y0..y0 + block {
         let start = y * width + x0;
-        image[start..start + BLOCK].fill(value);
+        image[start..start + block].fill(value);
     }
 }
 
@@ -164,24 +164,32 @@ pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, b
     for value in &mut image[..width * geometry.height] {
         *value = (*value).clamp(BASE_LOW, BASE_HIGH);
     }
+    let block = geometry.block;
     for row in 0..geometry.rows {
         for col in 0..geometry.columns {
             if geometry.is_anchor(col, row) {
-                fill_block(image, width, col, row, dx, dy, anchor_value(col, row));
+                fill_block(
+                    image,
+                    block,
+                    width,
+                    col * block + dx,
+                    row * block + dy,
+                    anchor_value(col, row),
+                );
             }
         }
     }
-    let area = (BLOCK * BLOCK) as i64;
+    let area = (block * block) as i64;
     let step = area * i64::from(MODULATION);
     for (index, &bit) in bits.iter().enumerate() {
         let row = index / geometry.pairs;
         let pair = index % geometry.pairs;
         let col = ANCHOR_COLS + 2 * pair;
-        let x0 = col * BLOCK + dx;
-        let x1 = (col + 1) * BLOCK + dx;
-        let y0 = row * BLOCK + dy;
-        let sum_a = i64::try_from(block_sum(image, width, x0, y0)).unwrap_or(0);
-        let sum_b = i64::try_from(block_sum(image, width, x1, y0)).unwrap_or(0);
+        let x0 = col * block + dx;
+        let x1 = (col + 1) * block + dx;
+        let y0 = row * block + dy;
+        let sum_a = i64::try_from(block_sum(image, block, width, x0, y0)).unwrap_or(0);
+        let sum_b = i64::try_from(block_sum(image, block, width, x1, y0)).unwrap_or(0);
         let middle = (sum_a + sum_b) / 2;
         let (target_a, target_b) = if bit {
             (middle + step, middle - step)
@@ -190,6 +198,7 @@ pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, b
         };
         shift_towards(
             image,
+            block,
             width,
             x0,
             y0,
@@ -197,6 +206,7 @@ pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, b
         );
         shift_towards(
             image,
+            block,
             width,
             x1,
             y0,
@@ -205,10 +215,10 @@ pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, b
     }
 }
 
-fn block_sum(image: &[u8], width: usize, x0: usize, y0: usize) -> u64 {
+fn block_sum(image: &[u8], block: usize, width: usize, x0: usize, y0: usize) -> u64 {
     let mut sum = 0u64;
-    for y in y0..y0 + BLOCK {
-        sum += image[y * width + x0..y * width + x0 + BLOCK]
+    for y in y0..y0 + block {
+        sum += image[y * width + x0..y * width + x0 + block]
             .iter()
             .map(|&value| u64::from(value))
             .sum::<u64>();
@@ -216,10 +226,10 @@ fn block_sum(image: &[u8], width: usize, x0: usize, y0: usize) -> u64 {
     sum
 }
 
-fn shift_towards(image: &mut [u8], width: usize, x0: usize, y0: usize, delta: i32) {
-    for y in y0..y0 + BLOCK {
+fn shift_towards(image: &mut [u8], block: usize, width: usize, x0: usize, y0: usize, delta: i32) {
+    for y in y0..y0 + block {
         let start = y * width + x0;
-        for value in &mut image[start..start + BLOCK] {
+        for value in &mut image[start..start + block] {
             *value = (i32::from(*value) + delta).clamp(30, 225) as u8;
         }
     }
@@ -277,17 +287,18 @@ impl Raster {
 /// beats every other candidate.
 pub fn find_alignment(y: &[u8], geometry: Geometry, raster: &mut Raster) -> Option<(usize, usize)> {
     raster.scan(y, geometry.width, geometry.height);
+    let block = geometry.block;
     let mut best: Option<(usize, usize, i64)> = None;
     let mut runner_up = i64::MIN;
-    for dy in 0..BLOCK {
-        for dx in 0..BLOCK {
+    for dy in 0..block {
+        for dx in 0..block {
             let mut score = 0i64;
             for row in 0..geometry.rows {
                 for col in 0..geometry.columns {
                     if !geometry.is_anchor(col, row) {
                         continue;
                     }
-                    let mean = i64::try_from(raster.sum(col * BLOCK + dx, row * BLOCK + dy, BLOCK))
+                    let mean = i64::try_from(raster.sum(col * block + dx, row * block + dy, block))
                         .unwrap_or(i64::MAX);
                     score += if (col + row) % 2 == 0 { mean } else { -mean };
                 }
@@ -312,6 +323,7 @@ pub fn find_alignment(y: &[u8], geometry: Geometry, raster: &mut Raster) -> Opti
 /// `raster.scan` must have run on the same `y` plane first.
 pub fn demodulate(geometry: Geometry, offset: (usize, usize), raster: &Raster, out: &mut [u8]) {
     let (dx, dy) = offset;
+    let block = geometry.block;
     for (byte_index, byte) in out.iter_mut().enumerate() {
         let mut value = 0u8;
         for bit in 0..8 {
@@ -319,8 +331,8 @@ pub fn demodulate(geometry: Geometry, offset: (usize, usize), raster: &Raster, o
             let row = index / geometry.pairs;
             let pair = index % geometry.pairs;
             let col = ANCHOR_COLS + 2 * pair;
-            let a = raster.sum(col * BLOCK + dx, row * BLOCK + dy, BLOCK);
-            let b = raster.sum((col + 1) * BLOCK + dx, row * BLOCK + dy, BLOCK);
+            let a = raster.sum(col * block + dx, row * block + dy, block);
+            let b = raster.sum((col + 1) * block + dx, row * block + dy, block);
             if a > b {
                 value |= 1 << (7 - bit);
             }
@@ -346,12 +358,12 @@ pub(crate) fn encode<R: Read>(
     dir: &Path,
     mut stream: R,
 ) -> Result<NamedTempFile> {
-    let geometry = Geometry::new(settings.width, settings.height)?;
+    let geometry = Geometry::new(settings.width, settings.height, settings.block)?;
     let transport_header = transport(
         Grid {
             width: settings.width,
             height: settings.height,
-            block: BLOCK,
+            block: settings.block,
         },
         settings.parity,
         layout.protected,
@@ -558,47 +570,99 @@ pub(crate) struct Reader<R> {
     progress: Progress,
 }
 
+/// Even block sizes that could fit `width` x `height`, in probe order.
+fn candidate_blocks(width: usize, height: usize) -> impl Iterator<Item = usize> {
+    CANDIDATE_BLOCKS
+        .into_iter()
+        .filter(move |&block| width.is_multiple_of(block) && height.is_multiple_of(block))
+}
+
 impl<R: Read> Reader<R> {
+    /// Opens a stealth stream without knowing the encoder's block size:
+    /// every even candidate block that fits the resolution is demodulated
+    /// from the incoming frames until the sync marker, transport header and
+    /// the header's own block size all agree on one candidate. The default
+    /// block is probed first, then the faster smaller ones, then the sturdier
+    /// larger ones. Only the frames needed for detection are consumed.
     pub(crate) fn open(mut pipe: R, width: usize, height: usize) -> Result<Self> {
-        let geometry = Geometry::new(width, height)?;
-        let mut image = vec![0; frame_len(geometry)];
+        let luma = width * height;
+        let mut image = vec![0; luma * 3 / 2];
+        pipe.read_exact(&mut image)
+            .map_err(|error| anyhow::anyhow!("no complete frame from FFmpeg: {error}"))?;
         let mut raster = Raster::default();
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut offset: Option<(usize, usize)> = None;
-        let mut read = 0u64;
-        while buffer.len() < HEADER_BYTES {
-            pipe.read_exact(&mut image)
-                .map_err(|error| anyhow::anyhow!("no complete frame from FFmpeg: {error}"))?;
-            raster.scan(&image[..width * height], width, height);
-            let at = match offset {
-                Some(at) => at,
-                None => find_alignment(&image[..width * height], geometry, &mut raster)
-                    .context("not a stealth file2video video; the sync anchors are missing")?,
+        raster.scan(&image[..luma], width, height);
+        // Candidates that passed the sync-marker check, in probe order.
+        let mut alive: Vec<(Geometry, (usize, usize), Vec<u8>)> = Vec::new();
+        for block in candidate_blocks(width, height) {
+            let Ok(geometry) = Geometry::new(width, height, block) else {
+                continue;
             };
+            let Some(at) = find_alignment(&image[..luma], geometry, &mut raster) else {
+                continue;
+            };
+            let mut buffer = Vec::new();
             demodulate(
                 geometry,
                 at,
                 &raster,
                 push_frame(&mut buffer, geometry.frame_bytes()),
             );
-            if offset.is_none() {
-                ensure!(
-                    buffer[..MARKER.len()] == MARKER,
-                    "not a stealth file2video video; the sync marker does not match"
+            if buffer[..MARKER.len()] != MARKER {
+                continue;
+            }
+            alive.push((geometry, at, buffer));
+        }
+        // Feed every surviving candidate until one transport header both
+        // parses and matches the probed geometry.
+        let mut winner: Option<(usize, Transport)> = None;
+        let mut read = 1u64;
+        loop {
+            for (index, (geometry, _, buffer)) in alive.iter().enumerate() {
+                if buffer.len() < HEADER_BYTES {
+                    continue;
+                }
+                let Ok(parsed) = parse_transport(&buffer[MARKER.len()..HEADER_BYTES]) else {
+                    continue;
+                };
+                if parsed.width == width
+                    && parsed.height == height
+                    && parsed.block == geometry.block
+                {
+                    winner = Some((index, parsed));
+                    break;
+                }
+            }
+            if winner.is_some() {
+                break;
+            }
+            // Headers that parsed damaged eliminate their candidate.
+            alive.retain(|(_, _, buffer)| buffer.len() < HEADER_BYTES);
+            ensure!(
+                !alive.is_empty(),
+                "not a stealth file2video video; the sync markers or transport header do not match"
+            );
+            pipe.read_exact(&mut image)
+                .map_err(|error| anyhow::anyhow!("no complete frame from FFmpeg: {error}"))?;
+            raster.scan(&image[..luma], width, height);
+            for (geometry, at, buffer) in &mut alive {
+                demodulate(
+                    *geometry,
+                    *at,
+                    &raster,
+                    push_frame(buffer, geometry.frame_bytes()),
                 );
-                offset = Some(at);
             }
             read += 1;
         }
-        let parsed = parse_transport(&buffer[MARKER.len()..HEADER_BYTES])
-            .context("not a stealth file2video video; the transport header is damaged")?;
+        let (index, parsed) = winner.expect("the loop ends when a winner is found");
+        let (geometry, offset, buffer) = alive.swap_remove(index);
         let stream_len = HEADER_BYTES as u64 + parsed.protected - ECC_SIZE as u64;
         Ok(Self {
             pipe,
             image,
             raster,
             geometry,
-            offset: offset.unwrap_or_default(),
+            offset,
             buffer,
             pos: HEADER_BYTES,
             parity: parsed.parity,
@@ -686,16 +750,31 @@ mod tests {
 
     #[test]
     fn geometry_matches_the_documented_capacities() {
-        let full = Geometry::new(1920, 1080).unwrap();
+        let full = Geometry::new(1920, 1080, super::BLOCK).unwrap();
         assert_eq!(full.frame_bytes(), 3498);
-        let small = Geometry::new(WIDTH, HEIGHT).unwrap();
+        let small = Geometry::new(WIDTH, HEIGHT, super::BLOCK).unwrap();
         assert_eq!(small.frame_bytes(), 47);
-        assert!(Geometry::new(24, 12).is_err());
+        // Block 4 packs (6/4)^2 = 2.25x as many bit pairs into the same
+        // frame; integer rounding gives 2.4x at this resolution.
+        let dense = Geometry::new(WIDTH, HEIGHT, 4).unwrap();
+        assert_eq!(dense.frame_bytes(), 116);
+        assert!(
+            dense.bits_per_frame() * 4 > small.bits_per_frame() * 9,
+            "block 4 must carry at least the documented 2.25x density"
+        );
+        assert!(Geometry::new(24, 12, super::BLOCK).is_err());
     }
 
     #[test]
     fn modulation_round_trips_through_clamping() {
-        let geometry = Geometry::new(WIDTH, HEIGHT).unwrap();
+        // Both a default and a dense block must survive a full round trip.
+        for block in [super::BLOCK, 4] {
+            round_trip(block);
+        }
+    }
+
+    fn round_trip(block: usize) {
+        let geometry = Geometry::new(WIDTH, HEIGHT, block).unwrap();
         let bits: Vec<bool> = (0..geometry.frame_bytes() * 8)
             .map(|i| (i % 7) % 2 == 0)
             .collect();
@@ -720,7 +799,7 @@ mod tests {
 
     #[test]
     fn alignment_rejects_a_plain_background() {
-        let geometry = Geometry::new(WIDTH, HEIGHT).unwrap();
+        let geometry = Geometry::new(WIDTH, HEIGHT, super::BLOCK).unwrap();
         let mut raster = Raster::default();
         assert_eq!(
             find_alignment(&background()[..WIDTH * HEIGHT], geometry, &mut raster),

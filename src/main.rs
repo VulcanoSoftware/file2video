@@ -87,6 +87,13 @@ enum Operation {
         /// (see the README, "Stealth mode").
         #[arg(long, value_name = "VIDEO_PATH")]
         stealth: Option<PathBuf>,
+        /// Stealth modulation block size in pixels (even, 2-16, default 6).
+        /// Each bit costs two blocks of pixels, so smaller blocks carry more
+        /// data per frame and encode proportionally faster: block 4 gives
+        /// about 2.3-3x the default throughput, block 2 up to 8-9x, at the
+        /// cost of some robustness to heavy re-encoding.
+        #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u16).range(2..=16))]
+        stealth_block: Option<u16>,
     },
     /// Recover and authenticate an original file from an MP4 video.
     Decode {
@@ -563,9 +570,15 @@ fn encode_stealth(
     background: &Path,
     password: Password,
     no_password: bool,
+    stealth_block: Option<u16>,
     options: Encoding,
     ctx: &Ctx,
 ) -> Result<u64> {
+    let block = usize::from(stealth_block.unwrap_or(u16::try_from(stealth::BLOCK).unwrap()));
+    ensure!(
+        block.is_multiple_of(2),
+        "--stealth-block must be an even number of pixels"
+    );
     if options.chroma == Some(true) {
         bail!(
             "--chroma cannot be combined with --stealth; the chroma planes carry the background colours"
@@ -598,12 +611,12 @@ fn encode_stealth(
     let width = options
         .width
         .or(ctx.config.width)
-        .unwrap_or_else(|| bg_width / stealth::BLOCK * stealth::BLOCK);
+        .unwrap_or_else(|| bg_width / block * block);
     let height = options
         .height
         .or(ctx.config.height)
-        .unwrap_or_else(|| bg_height / stealth::BLOCK * stealth::BLOCK);
-    let geometry = stealth::Geometry::new(width, height)?;
+        .unwrap_or_else(|| bg_height / block * block);
+    let geometry = stealth::Geometry::new(width, height, block)?;
     let fps = options.fps.or(ctx.config.fps).unwrap_or(30);
     let crf = options.crf.or(ctx.config.crf).unwrap_or(18);
     let preset = options
@@ -645,7 +658,7 @@ fn encode_stealth(
         .div_ceil(u64::try_from(geometry.frame_bytes()).context("frame capacity overflow")?);
     if !ctx.quiet {
         eprintln!(
-            "Encoding {size} bytes as a stealth layer over {} at {}x{}, {} fps, CRF {crf}, {parity} parity symbols; writing {frames} frames.",
+            "Encoding {size} bytes as a stealth layer over {} at {}x{}, block {block}, {} fps, CRF {crf}, {parity} parity symbols; writing {frames} frames.",
             background.display(),
             width,
             height,
@@ -660,6 +673,7 @@ fn encode_stealth(
         &stealth::StealthSettings {
             width,
             height,
+            block,
             fps,
             crf,
             preset,
@@ -1426,6 +1440,7 @@ fn run() -> Result<()> {
             password,
             settings,
             stealth,
+            stealth_block,
         } => {
             let frames = match stealth {
                 Some(background) => encode_stealth(
@@ -1435,6 +1450,7 @@ fn run() -> Result<()> {
                     &background,
                     password,
                     no_password,
+                    stealth_block,
                     settings,
                     &ctx,
                 )?,
