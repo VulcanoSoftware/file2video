@@ -566,10 +566,18 @@ fn encode_stealth(
     options: Encoding,
     ctx: &Ctx,
 ) -> Result<u64> {
-    ensure!(
-        !matches!(options.chroma, Some(true)) && ctx.config.chroma != Some(true),
-        "--chroma cannot be combined with --stealth; the chroma planes carry the background colours"
-    );
+    if options.chroma == Some(true) {
+        bail!(
+            "--chroma cannot be combined with --stealth; the chroma planes carry the background colours"
+        );
+    }
+    if options.chroma.is_none() && ctx.config.chroma == Some(true) && !ctx.quiet {
+        // A passive default from the config file must not block stealth
+        // encodes: warn and encode with the requested settings instead.
+        eprintln!(
+            "Warning: ignoring the chroma setting from the config file; the chroma planes carry the background colours in stealth encoding."
+        );
+    }
     if let Some(target) = options.optimise {
         ensure!(
             target == Target::Off,

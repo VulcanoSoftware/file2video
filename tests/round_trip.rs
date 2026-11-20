@@ -326,9 +326,14 @@ fn stealth_round_trip_with_looping_background_audio() {
         .collect();
     fs::write(dir.join("payload.bin"), &data).unwrap();
 
-    // A config-level optimise target must not block stealth encodes; the
-    // tool warns and encodes with the requested settings instead.
-    fs::write(dir.join("file2video.conf"), "optimise = smallest\n").unwrap();
+    // Config-level optimise and chroma targets must not block stealth
+    // encodes; the tool warns and encodes with the requested settings
+    // instead.
+    fs::write(
+        dir.join("file2video.conf"),
+        "optimise = smallest\nchroma = on\n",
+    )
+    .unwrap();
 
     // One second of 240x144 background video with an audio track; the data
     // layer needs far more frames than that, so both streams must loop.
@@ -388,6 +393,10 @@ fn stealth_round_trip_with_looping_background_audio() {
         stderr.contains("ignoring the optimise target"),
         "expected an optimise warning, got: {stderr}"
     );
+    assert!(
+        stderr.contains("ignoring the chroma setting"),
+        "expected a chroma warning, got: {stderr}"
+    );
 
     // The explicit flag remains rejected.
     let rejected = cli(
@@ -411,6 +420,29 @@ fn stealth_round_trip_with_looping_background_audio() {
     assert!(
         stderr.contains("cannot be combined with --stealth"),
         "expected an explicit --optimise rejection, got: {stderr}"
+    );
+
+    // The explicit --chroma flag remains rejected as well.
+    let rejected_chroma = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-3.mp4",
+            "--stealth",
+            "dummy.mp4",
+            "--chroma",
+            "--password",
+            "a",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    );
+    assert!(!rejected_chroma.status.success());
+    let stderr = String::from_utf8_lossy(&rejected_chroma.stderr);
+    assert!(
+        stderr.contains("cannot be combined with --stealth"),
+        "expected an explicit --chroma rejection, got: {stderr}"
     );
 
     let probe = Command::new("ffprobe")
