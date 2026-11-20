@@ -147,7 +147,14 @@ Speed: every bit costs two blocks of pixels, so the block size directly sets the
 | 4 | 7,946 | 0.24 MB/s | ~1.3 hours |
 | 2 | 32,093 | 0.96 MB/s | ~19 minutes |
 
-For the fastest stealth encodes, combine a small block with a high `--fps` (throughput scales linearly with the frame rate) and keep the background resolution high. Use smaller block sizes when your distribution channel is gentle (direct file transfer, mild re-encoding); keep the default 6 — or larger (`--stealth-block 8` and up) — when the video will be re-encoded aggressively (YouTube, streaming platforms).
+Other levers, measured on a 1278×720 CPU-only encode of 5 MiB (your numbers vary by machine — the GPU encoder is otherwise idle and leaves the CPU to the error correction):
+
+- `--preset veryfast` measured 1.35x the wall clock of the default `faster`, `--preset ultrafast` 2.8x. A faster preset means less compression, so the MP4 grows (about +18% for `veryfast`, +90% for `ultrafast`); the data layer itself survives more easily at higher bitrates.
+- A larger `--width`/`--height` does **not** speed a stealth encode up (the pipeline is pixel-bound; upscaling a 720p background to 1080p measured the same wall time for 2.25x the payload). Use it when you want a shorter video, not when you want speed.
+- `--fps` does not change encode or decode time either; it only shortens the video's playback duration (the same 593 frames at 60 fps last half as long and look even more like regular footage).
+- `--optimise smallest` inherits the all-intra choice from cell-format profiles, which is rarely the speed-optimal frame mode for a CRF 18 stealth layer; when stealth speed matters, prefer `--optimise fastest` or drop `--optimise` entirely, and try the explicit `--gpu` backends.
+
+Combined, `--stealth-block 2 --preset ultrafast --fps 60` measured ~7.5x the default settings on the reference machine, byte-identical round trip. Use smaller block sizes and faster presets when your distribution channel is gentle (direct file transfer, mild re-encoding); keep the default block 6 and CRF 18 when the video will be re-encoded aggressively (YouTube, streaming platforms).
 
 Example: encode a 1 GiB archive as a stealth layer at 2.25x the default density:
 
