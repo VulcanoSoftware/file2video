@@ -151,11 +151,12 @@
       </div>
     </div>
     <div class="note">
-      <b>Encryption.</b> Video files are always encrypted with a password (AES-GCM +
-      PBKDF2). There is deliberately no way to disable this: the video files travel
-      through YouTube and other platforms and must stay private. Tuning the work factor
-      with <b>pbkdf2_iterations</b> is the supported way to make encoding cheaper or
-      stronger.
+      <b>Encryption.</b> Video files are encrypted with a password (AES-GCM +
+      PBKDF2) unless you encode with <b>--no-password</b>; the videos travel
+      through YouTube and other platforms and should stay private. There is deliberately
+      no <b>password =</b> value in this file, so passwords never end up on disk by
+      accident. Tuning the work factor with <b>pbkdf2_iterations</b> is the supported
+      way to make encoding cheaper or stronger.
     </div>
   </section>
 

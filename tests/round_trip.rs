@@ -21,6 +21,80 @@ fn success(output: Output) {
 }
 
 #[test]
+fn round_trip_without_a_password() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let data: Vec<u8> = (0..70_001u32).map(|i| (i * 41) as u8).collect();
+    fs::write(dir.join("open.bin"), &data).unwrap();
+
+    success(cli(
+        dir,
+        &[
+            "encode",
+            "open.bin",
+            "open.mp4",
+            "--width",
+            "648",
+            "--height",
+            "360",
+            "--preset",
+            "ultrafast",
+            "--no-password",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    ));
+
+    // Decoding does not prompt for (or need) a password.
+    success(cli(dir, &["decode", "open.mp4", "restored-open.bin"]));
+    assert_eq!(fs::read(dir.join("restored-open.bin")).unwrap(), data);
+    // A password passed to a plaintext video is accepted and ignored.
+    success(cli(
+        dir,
+        &["decode", "open.mp4", "restored-2.bin", "--password", "abc"],
+    ));
+    assert_eq!(fs::read(dir.join("restored-2.bin")).unwrap(), data);
+
+    // Encoded videos must still demand the right password.
+    fs::write(dir.join("hidden.bin"), &data).unwrap();
+    success(cli(
+        dir,
+        &[
+            "encode",
+            "hidden.bin",
+            "hidden.mp4",
+            "--width",
+            "648",
+            "--height",
+            "360",
+            "--preset",
+            "ultrafast",
+            "--password",
+            "word",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    ));
+    let wrong = cli(
+        dir,
+        &["decode", "hidden.mp4", "bad.bin", "--password", "abc"],
+    );
+    assert!(!wrong.status.success());
+    let right = cli(
+        dir,
+        &[
+            "decode",
+            "hidden.mp4",
+            "restored-3.bin",
+            "--password",
+            "word",
+        ],
+    );
+    success(right);
+    assert_eq!(fs::read(dir.join("restored-3.bin")).unwrap(), data);
+}
+
+#[test]
 fn round_trip_non_aligned_frames_and_multiple_crypto_chunks() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();

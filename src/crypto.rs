@@ -20,6 +20,9 @@ pub struct Header {
     pub size: u64,
     pub tag: [u8; 16],
     pub hash: [u8; 32],
+    /// False for `--no-password` videos: the header carries a plaintext
+    /// SHA-256 instead of AES-GCM material.
+    pub sealed: bool,
 }
 
 impl Header {
@@ -40,12 +43,33 @@ impl Header {
             size,
             tag: [0; 16],
             hash: [0; 32],
+            sealed: true,
+        })
+    }
+
+    /// Builds the unencrypted header: same shape and size as the encrypted
+    /// one, so both formats use identical video layouts at any given size.
+    /// The hash is filled in once the whole plaintext has been staged.
+    pub fn plain(size: u64) -> Result<Self> {
+        ensure!(size <= MAX_GCM, "file exceeds the AES-GCM size limit");
+        Ok(Self {
+            iterations: 0,
+            salt: [0; 16],
+            nonce: [0; 12],
+            size,
+            tag: [0; 16],
+            hash: [0; 32],
+            sealed: false,
         })
     }
 
     pub fn bytes(&self) -> [u8; CRYPTO_SIZE] {
         let mut out = [0u8; CRYPTO_SIZE];
-        out[..9].copy_from_slice(b"CFVLT001\x01");
+        out[..9].copy_from_slice(if self.sealed {
+            b"CFVLT001\x01"
+        } else {
+            b"CFVLT001\x00"
+        });
         out[12..16].copy_from_slice(&self.iterations.to_be_bytes());
         out[16..32].copy_from_slice(&self.salt);
         out[32..44].copy_from_slice(&self.nonce);
@@ -56,12 +80,18 @@ impl Header {
     }
 
     pub fn parse(bytes: &[u8; CRYPTO_SIZE], size: u64) -> Result<Self> {
-        ensure!(&bytes[..9] == b"CFVLT001\x01", "invalid encryption header");
+        let sealed = match &bytes[..9] {
+            b"CFVLT001\x01" => true,
+            b"CFVLT001\x00" => false,
+            _ => bail!("invalid encryption header"),
+        };
         let iterations = u32_at(bytes, 12);
-        ensure!(
-            (1..=MAX_KDF).contains(&iterations),
-            "invalid PBKDF2 iterations"
-        );
+        if sealed {
+            ensure!(
+                (1..=MAX_KDF).contains(&iterations),
+                "invalid PBKDF2 iterations"
+            );
+        }
         ensure!(
             size <= MAX_GCM && u64_at(bytes, 60) == size,
             "invalid ciphertext length"
@@ -73,6 +103,7 @@ impl Header {
             size,
             tag: bytes[44..60].try_into().unwrap(),
             hash: bytes[68..100].try_into().unwrap(),
+            sealed,
         })
     }
 }
@@ -166,10 +197,95 @@ impl Stream {
     }
 }
 
+/// Integrity-verification companion to [`Stream`] for `--no-password`
+/// videos: passes the plaintext through untouched while computing
+/// the same SHA-256 digest the encrypted stream keeps.
+pub struct Plain {
+    digest: Sha256,
+    left: u64,
+}
+
+impl Plain {
+    pub fn new(size: u64) -> Self {
+        Self {
+            digest: Sha256::new(),
+            left: size,
+        }
+    }
+
+    pub fn update(&mut self, data: &mut [u8]) -> Result<()> {
+        let n = data.len() as u64;
+        ensure!(n <= self.left, "internal plaintext streaming length error");
+        self.digest.update(data);
+        self.left -= n;
+        Ok(())
+    }
+
+    pub fn finish(self) -> [u8; 32] {
+        self.digest.finalize().into()
+    }
+
+    pub fn verify(self, header: &Header) -> Result<()> {
+        ensure!(header.tag[..] == [0u8; 16], "invalid unencrypted header");
+        ensure!(self.left == 0, "truncated plaintext");
+        ensure!(
+            self.digest.finalize()[..] == header.hash,
+            "integrity check failed: damaged video"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aes_gcm::{Aes256Gcm, aead::AeadInPlace};
+
+    #[test]
+    fn plain_headers_round_trip_and_keep_the_same_shape() -> Result<()> {
+        let mut header = Header::plain(12321)?;
+        header.hash = [7; 32];
+        let bytes = header.bytes();
+        assert_eq!(&bytes[..8], b"CFVLT001");
+        assert_eq!(bytes[8], 0);
+        let parsed = Header::parse(&bytes, 12321)?;
+        assert!(!parsed.sealed);
+        assert_eq!(parsed.size, 12321);
+        assert_eq!(parsed.hash, [7; 32]);
+        // The encrypted magic and any other lead-in stay valid only as-is.
+        let sealed = Header::new(MAX_KDF, 12321)?;
+        assert_eq!(&sealed.bytes()[..8], b"CFVLT001");
+        assert_eq!(sealed.bytes()[8], 1);
+        let mut damaged = sealed.bytes();
+        damaged[8] = 9;
+        assert!(Header::parse(&damaged, 12321).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn plain_streams_pass_the_plaintext_through() -> Result<()> {
+        let mut data: Vec<u8> = (0..640_000u32).map(|i| (i * 7) as u8).collect();
+        let mut plain = Plain::new(data.len() as u64);
+        for chunk in data.chunks_mut(63) {
+            plain.update(chunk)?;
+        }
+        let mut header = Header::plain(data.len() as u64)?;
+        header.hash = plain.finish();
+        let mut verify = Plain::new(data.len() as u64);
+        for chunk in data.chunks_mut(97) {
+            verify.update(chunk)?;
+        }
+        verify.verify(&header)?;
+        // One flipped byte must fail the integrity check.
+        let mut flipped = data.clone();
+        flipped[123] ^= 1;
+        let mut verify = Plain::new(data.len() as u64);
+        for chunk in flipped.chunks_mut(97) {
+            verify.update(chunk)?;
+        }
+        assert!(verify.verify(&header).is_err());
+        Ok(())
+    }
 
     #[test]
     fn matches_reference_across_chunk_boundaries() -> Result<()> {

@@ -1,8 +1,8 @@
 # file2video
 
-Command-line tool that turns any file into an encrypted H.264 MP4 video and restores it byte for byte.
+Command-line tool that turns any file into an encrypted H.264 MP4 video and restores it byte for byte. Encryption is the default and can be turned off with `--no-password`.
 
-**How it works:** the file (and its name) is encrypted with AES-256-GCM, protected with Reed-Solomon error correction, drawn as cells with 16 brightness levels on video frames (optionally also in the color planes), and encoded with x264 or a hardware GPU encoder. Decoding reverses the process and publishes the output only after the password and integrity checks pass.
+**How it works:** the file (and its name) is encrypted with AES-256-GCM (optional with `--no-password`), protected with Reed-Solomon error correction, drawn as cells with 16 brightness levels on video frames (optionally also in the color planes), and encoded with x264 or a hardware GPU encoder. Decoding reverses the process and publishes the output only after the password and integrity checks pass.
 
 ## Requirements
 
@@ -79,6 +79,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--ecc-symbols` | `32` | Reed-Solomon parity bytes per 255-byte codeword (1–127). |
 | `--compress` | off | Smaller-output profile: `light`, `medium` or `high`. |
 | `--pbkdf2-iterations` | `600000` | PBKDF2-HMAC-SHA256 iterations (1–10,000,000). |
+| `--no-password` | off | Store the file without encryption: anyone who downloads the video can read it. A SHA-256 integrity check still protects against damaged videos; decoding never asks for a password. |
 | `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). |
 | `--stealth <VIDEO>` | off | Hide the data as a faint luma layer over a background video instead of storing cells; decoding is blind and does not need that video again. See [Stealth mode](#stealth-mode). |
 
@@ -217,7 +218,7 @@ pbkdf2_iterations = 600000
 
 The calibration database has its own file, `file2video-calibration.conf`, also in the working directory by default; move it with `--calibration <PATH>`. Neither file contains secrets.
 
-*Note on optional encryption:* video files are always encrypted with a password (AES-256-GCM + PBKDF2) because the videos are designed to travel through YouTube and similar platforms. There is deliberately no `encrypt = off` switch; `pbkdf2_iterations` is the supported tuning knob. Everything else in the configuration file is optional.
+*Note on encryption:* encoding is password-protected by default (AES-256-GCM + PBKDF2) because the videos are designed to travel through YouTube and similar platforms. Pass `--no-password` to store the file unencrypted (SHA-256 integrity check only); there is deliberately no `password =` value in the configuration file, so passwords never end up on disk by accident. `pbkdf2_iterations` remains the tuning knob for the work factor. Everything else in the configuration file is optional.
 
 ## Diagnostics
 
@@ -242,6 +243,8 @@ Set `FILE2VIDEO_DEBUG=1` to also print the exact FFmpeg command used for each GP
 ## Passwords
 
 `encode` asks for a password and a confirmation; `decode` asks once. For scripts, use `--password-file <FILE>`: a UTF-8 text file of at most 64 KiB, of which one trailing newline is ignored. `--password <TEXT>` also works but can leak through shell history and process lists. The two options cannot be combined, and an empty password is rejected.
+
+Encryption is the default, but encoding stores the file in the clear when you pass `--no-password`: the video then keeps only a SHA-256 integrity check, so a damaged video is still detected, while anyone who downloads it can read the file. Videos encoded with `--no-password` never ask for a password on decode (passing one is harmless), and the decoder detects automatically whether a video needs one.
 
 Passwords can only contain Latin-1 characters (for example ASCII and `é`). Other characters are rejected.
 
@@ -276,7 +279,8 @@ Passwords can only contain Latin-1 characters (for example ASCII and `é`). Othe
 
 - **Error correction:** Reed-Solomon (255 bytes per codeword) repairs up to half the parity count in corrupted bytes per codeword, which is 32 bytes at the default of 64. It repairs damaged pixels, not missing frames.
 - **The video is not a backup:** cropping, scaling, trimming, dropped frames or heavy re-encoding (for example by a video platform) can make recovery impossible. Keep the original file.
-- **Encryption:** AES-256-GCM with a key from PBKDF2-HMAC-SHA256 (600,000 iterations by default) and a random salt and nonce per file. The original filename is encrypted along with the data. A wrong password or a damaged video fails authentication, and no output is written.
+- **Encryption (default, optional with `--no-password`):** AES-256-GCM with a key from PBKDF2-HMAC-SHA256 (600,000 iterations by default) and a random salt and nonce per file. The original filename is encrypted along with the data. A wrong password or a damaged video fails authentication, and no output is written.
+- **Without a password (`--no-password`):** anyone who downloads the video can read the file byte for byte; the stored SHA-256 checks integrity only, so decoding still refuses damaged videos but offers no secrecy.
 - **What is not hidden:** the video visibly shows cells with 16 grey brightness levels, and its length reveals the approximate file size.
 
 ## Build from source
