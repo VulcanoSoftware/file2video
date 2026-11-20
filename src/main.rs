@@ -68,10 +68,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Operation {
-    /// Turn a file into an encrypted and error-corrected H.264/MP4 video.
+    /// Turn a file into an error-corrected H.264/MP4 video
+    /// (password-encrypted by default; see --no-password).
     Encode {
         input: PathBuf,
         output: PathBuf,
+        /// Store the file without a password: skip encryption and keep only
+        /// a SHA-256 integrity check (anyone who downloads the video can
+        /// read the file).
+        #[arg(long, conflicts_with_all = ["password", "password_file"])]
+        no_password: bool,
         #[command(flatten)]
         password: Password,
         #[command(flatten)]
@@ -300,9 +306,25 @@ fn regular_file_len(meta: fs::Metadata) -> Result<u64> {
     Ok(meta.len())
 }
 
-// Encrypts the plaintext into a scratch file and returns the crypto header
-// plus the staged ciphertext; the header bytes are what the video writers
-// prepend to the ciphertext stream.
+// Stages the plaintext (metadata + file content) into a scratch file: either
+// encrypted under the given password, or in the clear with a SHA-256
+// integrity hash when no password is used. Returns the 128-byte video header
+// plus the staged stream; the header bytes are what the video writers
+// prepend to the payload stream.
+fn stage_stream<R: Read>(
+    source: R,
+    plain_size: u64,
+    encrypt: Option<(&Zeroizing<Vec<u8>>, u32)>,
+    dir: &Path,
+) -> Result<(crypto::Header, File)> {
+    match encrypt {
+        Some((password, iterations)) => {
+            encrypt_stream(source, plain_size, password, iterations, dir)
+        }
+        None => stage_plain(source, plain_size, dir),
+    }
+}
+
 fn encrypt_stream<R: Read>(
     mut source: R,
     plain_size: u64,
@@ -340,11 +362,43 @@ fn encrypt_stream<R: Read>(
     Ok((header, staged))
 }
 
+fn stage_plain<R: Read>(
+    mut source: R,
+    plain_size: u64,
+    dir: &Path,
+) -> Result<(crypto::Header, File)> {
+    let mut header = crypto::Header::plain(plain_size)?;
+    let mut plain = crypto::Plain::new(plain_size);
+    let mut staged = tempfile::tempfile_in(dir)
+        .with_context(|| format!("could not create scratch file in {}", dir.display()))?;
+    let mut buffer = Zeroizing::new(vec![0; CHUNK]);
+    let mut left = plain_size;
+    while left != 0 {
+        let n = left.min(CHUNK as u64) as usize;
+        let chunk = &mut buffer[..n];
+        source
+            .read_exact(chunk)
+            .context("could not read input file (it may have shrunk)")?;
+        plain.update(chunk)?;
+        staged
+            .write_all(chunk)
+            .context("could not stage the file (check free disk space)")?;
+        left -= n as u64;
+    }
+    ensure!(
+        source.read(&mut [0])? == 0,
+        "input file grew while encoding"
+    );
+    header.hash = plain.finish();
+    Ok((header, staged))
+}
+
 fn encode(
     tools: &video::Tools,
     input: &Path,
     output: &Path,
     password: Password,
+    no_password: bool,
     options: Encoding,
     ctx: &Ctx,
 ) -> Result<u64> {
@@ -363,7 +417,11 @@ fn encode(
     } else {
         Layout::new(encrypted_size, parity)?
     };
-    let password = password.get(true)?;
+    let password = if no_password {
+        None
+    } else {
+        Some(password.get(true)?)
+    };
 
     let mut tools = tools.clone();
     let original_gpu = tools.gpu;
@@ -375,7 +433,12 @@ fn encode(
     let frames = layout.frames(settings.grid, settings.cell_bits, settings.chroma);
     if !ctx.quiet {
         eprintln!(
-            "Encrypting {size} bytes; writing {frames} video frames ({} luma levels per cell{}).",
+            "{}; writing {frames} video frames ({} luma levels per cell{}).",
+            if no_password {
+                format!("Storing {size} bytes without a password (integrity hash only)")
+            } else {
+                format!("Encrypting {size} bytes")
+            },
             1 << settings.cell_bits,
             if settings.chroma {
                 ", data in the chroma planes too"
@@ -388,11 +451,10 @@ fn encode(
     // The format places the final GCM tag before the ciphertext. Stage only
     // the ciphertext (never the input file) so the original is read once.
     let dir = parent(output);
-    let (header, mut staged) = encrypt_stream(
+    let (header, mut staged) = stage_stream(
         metadata.as_slice().chain(file),
         plain_size,
-        &password,
-        iterations,
+        password.as_ref().map(|password| (password, iterations)),
         dir,
     )?;
     drop(password);
@@ -500,6 +562,7 @@ fn encode_stealth(
     output: &Path,
     background: &Path,
     password: Password,
+    no_password: bool,
     options: Encoding,
     ctx: &Ctx,
 ) -> Result<u64> {
@@ -546,13 +609,16 @@ fn encode_stealth(
         .context("input size overflow")?;
     let encrypted_size = plain_size + CRYPTO_SIZE as u64;
     let layout = Layout::compact(encrypted_size, parity)?;
-    let password = password.get(true)?;
+    let password = if no_password {
+        None
+    } else {
+        Some(password.get(true)?)
+    };
     let dir = parent(output);
-    let (header, mut staged) = encrypt_stream(
+    let (header, mut staged) = stage_stream(
         metadata.as_slice().chain(file),
         plain_size,
-        &password,
-        iterations,
+        password.as_ref().map(|password| (password, iterations)),
         dir,
     )?;
     drop(password);
@@ -841,8 +907,9 @@ fn decode_stealth(
     Ok(destination)
 }
 
-/// Decrypts, authenticates, and stages the plaintext from an ECC reader; the
-/// reader must already sit at the first codeword byte.
+/// Validates and stages the plaintext from an ECC reader; the reader must
+/// already sit at the first codeword byte. The 128-byte video header says
+/// whether the bytes that follow are still to be decrypted.
 fn decrypt_staged<R: Read>(
     mut reader: ecc::Reader<'_, R>,
     layout: Layout,
@@ -852,15 +919,19 @@ fn decrypt_staged<R: Read>(
     let mut header = [0; CRYPTO_SIZE];
     reader.read_exact(&mut header)?;
     let header = crypto::Header::parse(&header, layout.encrypted - CRYPTO_SIZE as u64)?;
-    let password = password.get(false)?;
-    let mut crypto = crypto::Stream::new(&header, &password);
-    drop(password);
+    // Ask for a password only when the video actually carries ciphertext.
+    let mut unseal = if header.sealed {
+        let password = password.get(false)?;
+        Unseal::Sealed(Box::new(crypto::Stream::new(&header, &password)))
+    } else {
+        Unseal::Plain(crypto::Plain::new(header.size))
+    };
     let mut tmp = temporary(dir)?;
     let mut buffer = Zeroizing::new(vec![0; CHUNK]);
 
     let n = header.size.min(CHUNK as u64) as usize;
     reader.read_exact(&mut buffer[..n])?;
-    crypto.update(&mut buffer[..n], false)?;
+    unseal.update(&mut buffer[..n])?;
     // Do not trust metadata until authentication has succeeded.
     let metadata = format::parse_metadata(&buffer[..n], header.size)
         .map(|(name, offset)| (name.map(str::to_owned), offset));
@@ -871,14 +942,35 @@ fn decrypt_staged<R: Read>(
         let n = left.min(CHUNK as u64) as usize;
         let chunk = &mut buffer[..n];
         reader.read_exact(chunk)?;
-        crypto.update(chunk, false)?;
+        unseal.update(chunk)?;
         tmp.write_all(chunk)?;
         left -= n as u64;
     }
-    crypto.verify(&header)?;
+    unseal.verify(&header)?;
     let (name, _) = metadata?;
     drop(reader);
     Ok((tmp, name))
+}
+
+enum Unseal {
+    Sealed(Box<crypto::Stream>),
+    Plain(crypto::Plain),
+}
+
+impl Unseal {
+    fn update(&mut self, data: &mut [u8]) -> Result<()> {
+        match self {
+            Unseal::Sealed(crypto) => crypto.update(data, false),
+            Unseal::Plain(plain) => plain.update(data),
+        }
+    }
+
+    fn verify(self, header: &crypto::Header) -> Result<()> {
+        match self {
+            Unseal::Sealed(crypto) => crypto.verify(header),
+            Unseal::Plain(plain) => plain.verify(header),
+        }
+    }
 }
 
 fn destination_for(
@@ -1087,6 +1179,7 @@ fn run_matrix(
                 payload,
                 &video_path,
                 password_for("file2video benchmark"),
+                false,
                 bench,
                 &quiet,
             )
@@ -1311,6 +1404,7 @@ fn run() -> Result<()> {
         Operation::Encode {
             input,
             output,
+            no_password,
             password,
             settings,
             stealth,
@@ -1322,10 +1416,19 @@ fn run() -> Result<()> {
                     &output,
                     &background,
                     password,
+                    no_password,
                     settings,
                     &ctx,
                 )?,
-                None => encode(&tools, &input, &output, password, settings, &ctx)?,
+                None => encode(
+                    &tools,
+                    &input,
+                    &output,
+                    password,
+                    no_password,
+                    settings,
+                    &ctx,
+                )?,
             };
             eprintln!(
                 "Wrote {} frames in {} in {:.2}s.",
