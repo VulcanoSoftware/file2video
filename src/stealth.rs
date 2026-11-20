@@ -344,7 +344,7 @@ pub(crate) fn encode<R: Read>(
     settings: &StealthSettings,
     layout: Layout,
     dir: &Path,
-    stream: R,
+    mut stream: R,
 ) -> Result<NamedTempFile> {
     let geometry = Geometry::new(settings.width, settings.height)?;
     let transport_header = transport(
@@ -460,18 +460,25 @@ pub(crate) fn encode<R: Read>(
         bytes: 0,
         progress: Progress::new("Encode", frames),
     };
-    let sent = (move || -> Result<u64> {
+    let outcome = (|| -> Result<u64> {
         let codec = ecc::Codec::new(settings.parity);
         writer.push(&MARKER)?;
         writer.push(&transport_header)?;
         let header = layout.ecc_header(settings.parity);
         codec.encode(
-            header.as_slice().chain(stream),
+            header.as_slice().chain(stream.by_ref()),
             ECC_SIZE as u64 + layout.encrypted,
             |data| writer.push(data),
         )?;
         writer.finish()
-    })()?;
+    })();
+    let sent = match outcome {
+        Ok(sent) => sent,
+        Err(error) => {
+            drop(bg_process);
+            return Err(process.explain(error));
+        }
+    };
     drop(bg_process);
     process.finish()?;
     ensure!(sent >= 1, "no stealth frames were written");
