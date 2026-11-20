@@ -570,10 +570,20 @@ fn encode_stealth(
         !matches!(options.chroma, Some(true)) && ctx.config.chroma != Some(true),
         "--chroma cannot be combined with --stealth; the chroma planes carry the background colours"
     );
-    ensure!(
-        options.optimise_target(ctx.config) == Target::Off,
-        "--optimise cannot be combined with --stealth; calibration profiles only cover the cell format"
-    );
+    if let Some(target) = options.optimise {
+        ensure!(
+            target == Target::Off,
+            "--optimise cannot be combined with --stealth; calibration profiles only cover the cell format"
+        );
+    } else if options.optimise_target(ctx.config) != Target::Off {
+        // A passive default from the config file must not block stealth
+        // encodes: warn and encode with the requested settings instead.
+        if !ctx.quiet {
+            eprintln!(
+                "Warning: ignoring the optimise target from the config file; calibration profiles only cover the cell format and cannot apply to stealth encoding."
+            );
+        }
+    }
     let (bg_width, bg_height) = tools
         .dimensions(background)
         .context("could not probe the stealth background video")?;
