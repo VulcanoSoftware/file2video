@@ -52,7 +52,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Operation {
-    /// Turn a file into a Bit2Vid-compatible H.264/MP4 video.
+    /// Turn a file into an encrypted and error-corrected H.264/MP4 video.
     Encode {
         input: PathBuf,
         output: PathBuf,
@@ -145,21 +145,18 @@ struct Encoding {
     block_size: usize,
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u8).range(1..=60))]
     fps: u8,
-    /// Use a smaller-output Bit2Vid profile (can reduce recovery margin).
+    /// Use a smaller-output profile (can reduce recovery margin).
     #[arg(long, value_enum)]
     compress: Option<Profile>,
-    /// x264 quality (default: 18, or set by --compress; capped at 10 in default compact mode so cell data survives).
+    /// x264 quality (default: 8; capped at 8 so every cell survives quantization).
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
     crf: Option<u8>,
-    /// x264 speed/size preset (default: slow, or set by --compress).
+    /// x264 speed/size preset (default: faster, or set by --compress, for the CPU fallback and GPU speed tiers).
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(PRESETS))]
     preset: Option<String>,
-    /// Reed-Solomon parity bytes per 255-byte codeword (default: 64, or set by --compress).
+    /// Reed-Solomon parity bytes per 255-byte codeword (default: 32, or set by --compress).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=127))]
     ecc_symbols: Option<u8>,
-    /// Store only black/white cells so Python Bit2Vid 1.0 can decode the result.
-    #[arg(long)]
-    v1: bool,
     /// Number of PBKDF2-HMAC-SHA256 iterations.
     #[arg(long, default_value_t = 600_000, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_KDF)))]
     pbkdf2_iterations: u32,
@@ -173,26 +170,18 @@ impl Encoding {
             block: self.block_size,
         }
         .validate()?;
-        let (crf, preset, parity) = match self.compress {
-            None => (18, "slow", 64),
-            Some(Profile::Light) => (22, "slow", 64),
-            Some(Profile::Medium) => (30, "slower", 32),
-            Some(Profile::High) => (38, "veryslow", 16),
-        };
         // Compact mode stores one cell per video pixel at cell resolution;
         // the padded cells carry stream data just like any other cell.
-        let (grid, cell_bits, compact) = if self.v1 {
-            (display, 1, false)
-        } else {
-            (
-                Grid {
-                    width: video_dimension(display.width / display.block),
-                    height: video_dimension(display.height / display.block),
-                    block: 1,
-                },
-                4,
-                true,
-            )
+        let (crf, preset, parity) = match self.compress {
+            None => (8, "faster", 32),
+            Some(Profile::Light) => (8, "slow", 64),
+            Some(Profile::Medium) => (8, "slower", 32),
+            Some(Profile::High) => (8, "veryslow", 16),
+        };
+        let grid = Grid {
+            width: video_dimension(display.width / display.block),
+            height: video_dimension(display.height / display.block),
+            block: 1,
         };
         Ok((
             video::Settings {
@@ -201,8 +190,8 @@ impl Encoding {
                 fps: self.fps,
                 crf: self.crf.unwrap_or(crf),
                 preset: self.preset.unwrap_or_else(|| preset.to_owned()),
-                cell_bits,
-                compact,
+                cell_bits: 4,
+                compact: true,
             },
             self.ecc_symbols.map_or(parity, usize::from),
             self.pbkdf2_iterations,
@@ -274,8 +263,8 @@ fn encode(
         1 << settings.cell_bits
     );
 
-    // Bit2Vid places the final GCM tag before the ciphertext. Stage only the
-    // ciphertext (never the input file) so the original is read once.
+    // The format places the final GCM tag before the ciphertext. Stage only
+    // the ciphertext (never the input file) so the original is read once.
     let dir = parent(output);
     let mut staged = tempfile::tempfile_in(dir).with_context(|| {
         format!(
@@ -310,7 +299,7 @@ fn encode(
     let tmp = temporary(dir)?;
     let mut process = tools.encode(&settings, tmp.path())?;
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
-    let mut sink = video::Sink::new(pipe, settings.grid, settings.cell_bits, frames);
+    let mut sink = video::Sink::new(pipe, settings.grid, frames);
     sink.push(&format::transport(
         settings.display,
         parity,

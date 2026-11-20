@@ -22,7 +22,7 @@ impl Grid {
         self.validate_layout()?;
         ensure!(
             self.bits() >= TRANSPORT_SIZE * 8,
-            "frame too small for the Bit2Vid header; increase the resolution or reduce the block size"
+            "frame too small for the video header; increase the resolution or reduce the block size"
         );
         Ok(self)
     }
@@ -130,10 +130,10 @@ pub fn parse_transport(data: &[u8]) -> Result<Transport> {
             }
         }
     }
-    ensure!(&vote[..8] == b"CFVID001", "not a Bit2Vid v1 header");
+    ensure!(&vote[..8] == b"CFVID001", "not a file2video header");
     let cell_bits = vote[8];
     ensure!(
-        cell_bits == 1 || cell_bits == 4,
+        cell_bits == 4,
         "unsupported cell width in the transport header"
     );
     let compact = vote[9] == 1;
@@ -186,7 +186,7 @@ impl Layout {
         ensure!((1..=127).contains(&parity), "parity must be in 1..=127");
         ensure!(
             (CRYPTO_SIZE as u64..=CRYPTO_SIZE as u64 + MAX_GCM).contains(&encrypted),
-            "payload exceeds the Bit2Vid v1 AES-GCM size limit"
+            "payload exceeds the AES-GCM size limit"
         );
         let data = if compact {
             encrypted + ECC_SIZE as u64

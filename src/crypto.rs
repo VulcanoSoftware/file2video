@@ -1,4 +1,4 @@
-//! Streaming adapter for Bit2Vid v1 (one AES-GCM message per file, no AAD).
+//! Streaming AES-256-GCM adapter (one message per file, no AAD).
 //! Crypto primitives are RustCrypto. Only the final update may be unaligned.
 use aes::Aes256;
 use aes::cipher::{BlockEncrypt, InnerIvInit, KeyInit, StreamCipher};
@@ -28,10 +28,7 @@ impl Header {
             (1..=MAX_KDF).contains(&iterations),
             "invalid PBKDF2 iterations"
         );
-        ensure!(
-            size <= MAX_GCM,
-            "file exceeds the Bit2Vid v1 AES-GCM size limit"
-        );
+        ensure!(size <= MAX_GCM, "file exceeds the AES-GCM size limit");
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; 12];
         getrandom::fill(&mut salt).map_err(|e| anyhow::anyhow!("random salt: {e}"))?;
@@ -84,10 +81,10 @@ pub fn password_bytes(password: &str) -> Result<Zeroizing<Vec<u8>>> {
     ensure!(!password.is_empty(), "password cannot be empty");
     let mut bytes = Zeroizing::new(Vec::with_capacity(password.len()));
     for ch in password.chars() {
-        // PyCryptodome's PBKDF2 encodes Python str using Latin-1, not UTF-8.
+        // Passwords are encoded as Latin-1 bytes, not UTF-8.
         match u8::try_from(u32::from(ch)) {
             Ok(byte) => bytes.push(byte),
-            Err(_) => bail!("Bit2Vid v1 passwords must use Latin-1 characters"),
+            Err(_) => bail!("passwords must use only Latin-1 characters"),
         }
     }
     Ok(bytes)
@@ -115,7 +112,7 @@ impl Stream {
         aes.encrypt_block((&mut h).into());
         let mut counter = [0u8; BLOCK];
         counter[..12].copy_from_slice(&nonce);
-        counter[15] = 1; // J0 for the 96-bit nonce defined by Bit2Vid v1.
+        counter[15] = 1; // J0 for the 96-bit nonce.
         let mut mask = counter;
         aes.encrypt_block((&mut mask).into());
         counter[15] = 2; // First message block uses inc32(J0).
