@@ -79,6 +79,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--ecc-symbols` | `32` | Reed-Solomon parity bytes per 255-byte codeword (1–127). |
 | `--compress` | off | Smaller-output profile: `light`, `medium` or `high`. |
 | `--pbkdf2-iterations` | `600000` | PBKDF2-HMAC-SHA256 iterations (1–10,000,000). |
+| `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). |
 
 `--compress` sets preset and parity together: `light` = `slow` / 64, `medium` = `slower` / 32, `high` = `veryslow` / 16; CRF stays capped at 8 (6 with `--intra`). Explicit `--crf`, `--preset`, `--chroma`, `--intra` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
 
@@ -92,7 +93,30 @@ Measures every relevant configuration on this machine: each available backend ×
 ./file2video benchmark archive.zip              # real file, e.g. to check its MP4 size
 ```
 
+The complete result table is always saved to the calibration file (default `file2video-calibration.conf` in the working directory), so the run doubles as machine calibration for [`--optimise`](#calibration-and-automatic-optimisation).
+
 Backends whose trial encode fails (for example when a GPU driver is missing) are listed with their FFmpeg error. Run it before choosing `--chroma`/`--intra` to see what is fastest on your machine.
+
+## Calibration and automatic optimisation
+
+Every machine encodes differently: on a desktop with a strong GPU, AMF/NVENC/Quick Sync can be several times faster than the CPU; on other machines the all-intra CPU encoder wins on file size and decode speed. `benchmark` measures all of these combinations, stores the results in a small calibration file, and `--optimise` makes every encode automatically use the best one for *this* machine:
+
+| Target | Meaning |
+| --- | --- |
+| `--optimise smallest` | Pick the measured configuration that produces the smallest MP4 for the payload. |
+| `--optimise fastest` | Pick the measured configuration with the lowest encode + decode time. |
+| `--optimise balanced` | Pick the best combination of speed and size (both normalised against the other candidates). |
+| `--optimise off` | Default: always use exactly the flags and config values you passed. |
+
+How it works:
+
+- `benchmark` always writes `file2video-calibration.conf` in the working directory (change the location with `--calibration <PATH>`). It contains one measurement line per backend × mode (frames, payload, encode/decode seconds, MP4 size) plus `failed` lines for the combinations that do not work (for example a GPU driver that is missing).
+- When you run `encode` with `--optimise` and no fresh calibration file exists yet, the tool first calibrates itself: it generates an 8 MiB pseudo-random payload, measures every backend × mode, saves the file, and continues with the winner.
+- You do **not** have to benchmark again every time: the calibration file is reused as long as it is fresh. It records a **fingerprint** of your machine — OS and CPU architecture, CPU model, thread count, GPU names and driver versions, and the FFmpeg version. A hardware upgrade, a GPU driver update, or a different FFmpeg build changes the fingerprint, so the next `--optimise` encode automatically recalibrates once and saves the new results.
+- With `--gpu <backend>` set, `--optimise` only chooses the frame mode (`--intra`/`--chroma`) within that backend; with `--gpu auto` (default) it may also choose between GPU backends and the CPU.
+- Supported but overridden by explicit flags: `--chroma`/`--intra`, when passed, restrict the candidates to those that honour them.
+- `estimate` shows which configuration `--optimise` would pick on this machine; it only reads the calibration file and never benchmarks.
+- Encoding failures are retried once: when a configuration that `--optimise` selected turns out to fail (mid-encode FFmpeg errors do exist, see the AMF chroma note at [GPU acceleration](#gpu-acceleration)), the tool prints a warning and finishes the encode with your configured settings.
 
 ### `decode <INPUT> <OUTPUT>`
 
@@ -112,7 +136,7 @@ Recovers the original file from the video. The resolution, block size, cell dept
 
 ### `estimate <INPUT>`
 
-Prints the exact encrypted size, frame count and playback duration for a file, without writing any video. It accepts the same video options as `encode`. It cannot predict the MP4 file size or the encoding time.
+Prints the exact encrypted size, frame count and playback duration for a file, without writing any video. It accepts the same video options as `encode`, plus `--optimise`: with a fresh calibration it also prints which backend and frame mode an optimised encode would use on this machine. It never benchmarks and cannot predict the MP4 file size or the encoding time.
 
 ### Options for all commands
 
@@ -122,7 +146,50 @@ Prints the exact encrypted size, frame count and playback duration for a file, w
 | `--no-download` | Never download FFmpeg; use what is already on the system. |
 | `--ffprobe <PATH>` | ffprobe executable (default: next to FFmpeg, else `PATH`). |
 | `--gpu <MODE>` | Hardware encoder for `encode`: `auto` (default), `off`, `amf`, `nvenc`, `qsv`, `vaapi`, `video-toolbox`. See [GPU acceleration](#gpu-acceleration). |
-| `--threads <N>` | Thread limit for the Rust error-correction pool and for FFmpeg (`0` = automatic). |
+| `--threads <N>` | Thread limit for the Rust error-correction pool and for FFmpeg (default: `0` = automatic). |
+| `--config <PATH>` | Configuration file with extra defaults; default: `file2video.conf` in the working directory when it exists. See [Configuration file](#configuration-file). |
+| `--calibration <PATH>` | Calibration database; default `file2video-calibration.conf` in the working directory. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). |
+
+## Configuration file
+
+Most settings become defaults in an optional configuration file instead of long command lines. `file2video` automatically loads `file2video.conf` from the working directory when it exists; `--config <PATH>` loads an explicit file instead (a missing explicit file is an error; a missing default file is fine).
+
+Values in the file are defaults: every command-line flag you pass overrides it. Unknown values are rejected with the file name and line number, so mistakes are easy to find.
+
+Don't want to edit text files? The [config generator](https://vulcanosoftware.github.io/file2video/) builds this file in your browser — pick your values, copy the result, done. It is a static page served from [docs/index.html](docs/index.html).
+
+| Key | Values (default) | Description |
+| --- | --- | --- |
+| `width`, `height` | even numbers ≤ 8192 (1920, 1080) | Storage grid. |
+| `block_size` | `8`, `10`, `12`, `16`, `20` (8) | Pixels per data cell. |
+| `fps` | 1–60 (30) | Playback speed. |
+| `compress` | `light`, `medium`, `high` | Compression profile (sets preset + parity like `--compress`). |
+| `crf` | 0–51 (8) | x264 quality. |
+| `preset` | `ultrafast` … `veryslow` (`faster`) | Speed/size preset. |
+| `chroma` | `on`/`off` (off) | Also store data in the color planes. Accepts `on`/`yes`/`true`/`1` and `off`/`no`/`false`/`0`. |
+| `intra` | `on`/`off` (off) | All-intra frames. |
+| `ecc_symbols` | 1–127 (32, or set by `compress`) | Reed-Solomon parity per codeword. |
+| `pbkdf2_iterations` | 1–10,000,000 (600000) | PBKDF2-HMAC-SHA256 work factor. |
+| `threads` | 0–256 (0) | Thread limit; 0 = automatic. |
+| `gpu` | `auto`, `off`, `amf`, `nvenc`, `qsv`, `vaapi`, `video-toolbox` (auto) | Hardware encoder choice. |
+| `optimise` | `off`, `smallest`, `fastest`, `balanced` (off) | Use the saved calibration, see above. |
+
+Example:
+
+```ini
+# file2video.conf
+optimise = balanced
+fps = 30
+ecc_symbols = 32
+gpu = auto
+pbkdf2_iterations = 600000
+# chroma = on
+# intra = off
+```
+
+The calibration database has its own file, `file2video-calibration.conf`, also in the working directory by default; move it with `--calibration <PATH>`. Neither file contains secrets.
+
+*Note on optional encryption:* video files are always encrypted with a password (AES-256-GCM + PBKDF2) because the videos are designed to travel through YouTube and similar platforms. There is deliberately no `encrypt = off` switch; `pbkdf2_iterations` is the supported tuning knob. Everything else in the configuration file is optional.
 
 ## Diagnostics
 
@@ -139,6 +206,8 @@ During long runs, progress lines show frames, percentage, throughput in MB/s, el
 ```text
 Encode: 90000/353959 frames (25.4%) | 21.3 MB/s | elapsed 1m07s | eta 3m18s
 ```
+
+If FFmpeg dies in the middle of an encode instead of cleanly failing (for example a broken-pipe message), the error now carries the last lines of FFmpeg's own stderr (`FFmpeg reported: …`), so the real cause is visible without rerunning with `FILE2VIDEO_DEBUG=1`.
 
 Set `FILE2VIDEO_DEBUG=1` to also print the exact FFmpeg command used for each GPU trial encode, which is useful when reporting a problem.
 
@@ -167,6 +236,7 @@ Passwords can only contain Latin-1 characters (for example ASCII and `é`). Othe
 | macOS | VideoToolbox | `video-toolbox` |
 
 - Hybrid laptops: when a discrete GPU is detected (any NVIDIA card, Intel Arc, or an AMD Radeon RX model), its encoder is tried before the integrated GPU's.
+- With `--optimise`, the measured calibration decides which backend wins on this machine instead of the trial order above; see [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). Some combinations are broken in specific GPU drivers (for example the chroma modes of the AMF encoder on certain Adrenalin driver versions, which fail mid-encode); the benchmark marks those combinations as failed and `--optimise` never selects them.
 - A GPU is never required: without a working hardware encoder, or with `--gpu off`, the video is encoded on the CPU with `libx264`. FFmpeg still needs `libx264` for that fallback path.
 - A specific `--gpu` value forces that backend and fails if it is not available in your FFmpeg build or its trial encode fails.
 - The GPU encoder is used for encoding only; decoding always runs on the CPU.

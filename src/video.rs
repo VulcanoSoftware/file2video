@@ -5,6 +5,8 @@ use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 // A higher CRF erases whole single-pixel luma levels per frame; crf 8 keeps
@@ -47,6 +49,33 @@ impl Gpu {
             Self::VideoToolbox => "h264_videotoolbox",
             Self::Auto | Self::Off => unreachable!(),
         }
+    }
+
+    /// The short name used in the calibration file and the config file.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Amf => "amf",
+            Self::Nvenc => "nvenc",
+            Self::Qsv => "qsv",
+            Self::Vaapi => "vaapi",
+            Self::VideoToolbox => "video-toolbox",
+            Self::Auto => "auto",
+            Self::Off => "cpu",
+        }
+    }
+
+    /// Parses the short name; the inverse of `short_name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "libx264" | "x264" => Self::Off,
+            "amf" => Self::Amf,
+            "nvenc" => Self::Nvenc,
+            "qsv" => Self::Qsv,
+            "vaapi" => Self::Vaapi,
+            "video-toolbox" | "videotoolbox" => Self::VideoToolbox,
+            "auto" => Self::Auto,
+            _ => return None,
+        })
     }
 
     fn candidates() -> &'static [Self] {
@@ -159,6 +188,7 @@ pub fn local_path(path: &Path) -> PathBuf {
     url.into()
 }
 
+#[derive(Clone)]
 pub struct Tools {
     pub ffmpeg: PathBuf,
     pub ffprobe: Option<PathBuf>,
@@ -498,15 +528,42 @@ impl Tools {
     }
 
     fn spawn(&self, mut cmd: Command) -> Result<Process> {
-        let child = cmd.spawn().with_context(|| {
+        // Capture the child's stderr in a draining thread; keeping only the
+        // last lines means a mid-run failure reports the actual FFmpeg error
+        // instead of a bare broken pipe, without risking a full pipe buffer.
+        const TAIL_BYTES: usize = 8192;
+        let tail_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut child = cmd.stderr(Stdio::piped()).spawn().with_context(|| {
             format!(
                 "could not run {} (install FFmpeg with libx264 or pass --ffmpeg)",
                 self.ffmpeg.display()
             )
         })?;
+        let pipe = child.stderr.take().context("missing FFmpeg stderr")?;
+        let shared = Arc::clone(&tail_shared);
+        let reader = std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut tail = shared
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        tail.extend_from_slice(&buffer[..n]);
+                        if tail.len() > TAIL_BYTES {
+                            let excess = tail.len() - TAIL_BYTES;
+                            tail.drain(..excess);
+                        }
+                    }
+                }
+            }
+        });
         Ok(Process {
             child,
             waited: false,
+            tail: Some((tail_shared, reader)),
         })
     }
 }
@@ -514,6 +571,54 @@ impl Tools {
 enum Encoder {
     Cpu,
     Gpu(Gpu),
+}
+
+impl Process {
+    fn stderr_tail(&mut self) -> String {
+        if let Some((shared, reader)) = self.tail.take() {
+            let _ = reader.join();
+            let tail = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let text = String::from_utf8_lossy(tail.as_slice()).into_owned();
+            let lines: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            let start = lines.len().saturating_sub(4);
+            return lines[start..].join("; ");
+        }
+        String::new()
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        let status = self.child.wait()?;
+        self.waited = true;
+        if !status.success() {
+            let tail = self.stderr_tail();
+            if tail.is_empty() {
+                bail!("FFmpeg failed ({status})");
+            }
+            bail!("FFmpeg failed ({status}): {tail}");
+        }
+        Ok(())
+    }
+
+    /// Attaches the captured FFmpeg output to an error that happened while
+    /// the process was still running (for example a broken pipe after FFmpeg
+    /// exited), then stops the process.
+    pub fn explain(mut self, error: anyhow::Error) -> anyhow::Error {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.waited = true;
+        let tail = self.stderr_tail();
+        if tail.is_empty() {
+            error
+        } else {
+            error.context(format!("FFmpeg reported: {tail}"))
+        }
+    }
 }
 
 fn debug() -> bool {
@@ -581,6 +686,7 @@ fn frame_sync_for(version_line: &str) -> [&'static str; 2] {
     }
 }
 
+#[derive(Clone)]
 pub struct Settings {
     /// The cell grid: one cell per frame fed to FFmpeg. In compact mode a
     /// cell is one video pixel; otherwise a cell is a grid.block pixel square.
@@ -600,18 +706,12 @@ pub struct Settings {
     pub intra: bool,
 }
 
+type Tail = (Arc<Mutex<Vec<u8>>>, JoinHandle<()>);
+
 pub struct Process {
     pub child: Child,
     waited: bool,
-}
-
-impl Process {
-    pub fn finish(mut self) -> Result<()> {
-        let status = self.child.wait()?;
-        self.waited = true;
-        ensure!(status.success(), "FFmpeg failed ({status})");
-        Ok(())
-    }
+    tail: Option<Tail>,
 }
 
 impl Drop for Process {
@@ -619,6 +719,9 @@ impl Drop for Process {
         if !self.waited {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+        if let Some((_, reader)) = self.tail.take() {
+            let _ = reader.join();
         }
     }
 }

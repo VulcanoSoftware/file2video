@@ -175,3 +175,64 @@ fn empty_file_and_truncated_video() {
     );
     assert!(!dir.join("short.bin").exists());
 }
+
+#[test]
+fn optimise_uses_and_updates_the_calibration_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut seed = 0xfeed_beefu32;
+    let data: Vec<u8> = (0..300_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    fs::write(dir.join("payload.bin"), &data).unwrap();
+    fs::write(dir.join("password.txt"), "demo\n").unwrap();
+    fs::write(
+        dir.join("file2video.conf"),
+        "optimise = balanced\nfps = 15\necc_symbols = 16\n",
+    )
+    .unwrap();
+
+    success(cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "output.mp4",
+            "--preset",
+            "ultrafast",
+            "--password-file",
+            "password.txt",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    ));
+    let calibration = fs::read_to_string(dir.join("file2video-calibration.conf")).unwrap();
+    assert!(calibration.starts_with("file2video-calibration v1"));
+    assert!(calibration.contains("fingerprint = "));
+    assert!(calibration.contains("measured = cpu|"));
+
+    success(cli(
+        dir,
+        &[
+            "decode",
+            "output.mp4",
+            "restored.bin",
+            "--password-file",
+            "password.txt",
+        ],
+    ));
+    assert_eq!(fs::read(dir.join("restored.bin")).unwrap(), data);
+
+    let second = cli(dir, &["estimate", "payload.bin", "--optimise", "fastest"]);
+    let text = String::from_utf8_lossy(&second.stdout).into_owned();
+    success(second);
+    assert!(
+        text.contains("Optimising for fastest would use: cpu"),
+        "{text}"
+    );
+}
