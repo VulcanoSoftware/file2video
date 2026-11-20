@@ -184,6 +184,8 @@ Values in the file are defaults: every command-line flag you pass overrides it. 
 
 Don't want to edit text files? The [config generator](https://vulcanosoftware.github.io/file2video/) builds this file in your browser — pick your values, copy the result, done. It is a static page served from [docs/index.html](docs/index.html).
 
+Maintainers: the page deploys automatically on every push to `main` that touches `docs/` ([pages.yml](.github/workflows/pages.yml)). GitHub does not let the workflow's own token create a Pages site, so before the first deploy, enable Pages once: **Settings → Pages → Build and deployment → Source: GitHub Actions**, then re-run the workflow from the Actions tab.
+
 | Key | Values (default) | Description |
 | --- | --- | --- |
 | `width`, `height` | even numbers ≤ 8192 (1920, 1080) | Storage grid. |
