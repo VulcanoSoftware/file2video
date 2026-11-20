@@ -1,3 +1,5 @@
+mod calibrate;
+mod config;
 mod crypto;
 mod diag;
 mod download;
@@ -5,10 +7,12 @@ mod ecc;
 mod format;
 mod video;
 
+use calibrate::{Calibration, Target};
+use config::{Config, Profile};
 use video::speed;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use format::{CRYPTO_SIZE, ECC_SIZE, Grid, Layout, MAX_KDF, TRANSPORT_SIZE, video_dimension};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, Write};
@@ -18,17 +22,20 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 const CHUNK: usize = 256 * 1024;
-const PRESETS: [&str; 9] = [
-    "ultrafast",
-    "superfast",
-    "veryfast",
-    "faster",
-    "fast",
-    "medium",
-    "slow",
-    "slower",
-    "veryslow",
+const CALIBRATION_PAYLOAD_MIB: u64 = 8;
+const MODES: [(&str, bool, bool); 4] = [
+    ("base", false, false),
+    ("intra", true, false),
+    ("chroma", false, true),
+    ("intra+chroma", true, true),
 ];
+
+/// Slices of shared context every operation receives from `run`.
+struct Ctx<'a> {
+    config: &'a Config,
+    calibration: &'a Path,
+    quiet: bool,
+}
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -41,12 +48,18 @@ struct Cli {
     /// ffprobe executable (default: next to FFmpeg or on PATH).
     #[arg(long, global = true, value_name = "PATH")]
     ffprobe: Option<PathBuf>,
-    /// Thread limit for each of the Rust ECC pool and FFmpeg (0 = automatic).
-    #[arg(long, global = true, default_value_t = 0)]
-    threads: usize,
+    /// Thread limit for each of the Rust ECC pool and FFmpeg (default: 0 = automatic).
+    #[arg(long, global = true, value_name = "N")]
+    threads: Option<usize>,
     /// Hardware encoder for the video (auto/off/amf/nvenc/qsv/vaapi/video-toolbox).
-    #[arg(long, global = true, value_enum, default_value_t = video::Gpu::Auto)]
-    gpu: video::Gpu,
+    #[arg(long, global = true, value_enum, value_name = "NAME")]
+    gpu: Option<video::Gpu>,
+    /// Configuration file with extra defaults (default: file2video.conf in the working directory).
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Calibration database (default: file2video-calibration.conf in the working directory).
+    #[arg(long, global = true, value_name = "PATH")]
+    calibration: Option<PathBuf>,
     /// Do not download a full FFmpeg build automatically (default: download when missing).
     #[arg(long, global = true)]
     no_download: bool,
@@ -100,6 +113,13 @@ enum Operation {
     },
 }
 
+fn password_for(program: &str) -> Password {
+    Password {
+        password: Some(program.to_owned()),
+        password_file: None,
+    }
+}
+
 #[derive(Args)]
 struct Password {
     /// Read the password from a UTF-8 text file (one trailing newline is ignored).
@@ -140,23 +160,16 @@ impl Password {
     }
 }
 
-#[derive(Clone, ValueEnum)]
-enum Profile {
-    Light,
-    Medium,
-    High,
-}
-
 #[derive(Clone, Args)]
 struct Encoding {
-    #[arg(long, default_value_t = 1920)]
-    width: usize,
-    #[arg(long, default_value_t = 1080)]
-    height: usize,
-    #[arg(long, default_value_t = 8)]
-    block_size: usize,
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u8).range(1..=60))]
-    fps: u8,
+    #[arg(long, value_name = "PIXELS")]
+    width: Option<usize>,
+    #[arg(long, value_name = "PIXELS")]
+    height: Option<usize>,
+    #[arg(long, value_name = "PIXELS")]
+    block_size: Option<usize>,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=60))]
+    fps: Option<u8>,
     /// Use a smaller-output profile (can reduce recovery margin).
     #[arg(long, value_enum)]
     compress: Option<Profile>,
@@ -164,7 +177,7 @@ struct Encoding {
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
     crf: Option<u8>,
     /// x264 speed/size preset (default: faster, or set by --compress, for the CPU fallback and GPU speed tiers).
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(PRESETS))]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(config::PRESETS))]
     preset: Option<String>,
     /// Reed-Solomon parity bytes per 255-byte codeword (default: 32, or set by --compress).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=127))]
@@ -172,28 +185,37 @@ struct Encoding {
     /// Store payload cells in the U and V chroma planes too (+50% capacity per
     /// frame, ~33% fewer frames, same MP4 size; verify with a round trip on
     /// your GPU encoder first).
-    #[arg(long)]
-    chroma: bool,
+    #[arg(long, num_args(0..=1), default_missing_value = "true")]
+    chroma: Option<bool>,
     /// Encode every frame as a keyframe (all-intra): smaller at CRF 6 and
     /// faster to decode, 10x more cells for error correction to watch.
-    #[arg(long)]
-    intra: bool,
+    #[arg(long, num_args(0..=1), default_missing_value = "true")]
+    intra: Option<bool>,
+    /// Automatically pick the best measured backend and frame mode for this
+    /// machine (default: off, or set by the config file).
+    #[arg(long, value_enum, value_name = "TARGET")]
+    optimise: Option<Target>,
     /// Number of PBKDF2-HMAC-SHA256 iterations.
-    #[arg(long, default_value_t = 600_000, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_KDF)))]
-    pbkdf2_iterations: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_KDF)))]
+    pbkdf2_iterations: Option<u32>,
 }
 
 impl Encoding {
-    fn resolve(self) -> Result<(video::Settings, usize, u32)> {
+    /// What to optimise for: an explicit flag wins over the config file.
+    fn optimise_target(&self, config: &Config) -> Target {
+        self.optimise.or(config.optimise).unwrap_or(Target::Off)
+    }
+
+    fn resolve(&self, config: &Config) -> Result<(video::Settings, usize, u32)> {
         let display = Grid {
-            width: self.width,
-            height: self.height,
-            block: self.block_size,
+            width: self.width.or(config.width).unwrap_or(1920),
+            height: self.height.or(config.height).unwrap_or(1080),
+            block: self.block_size.or(config.block_size).unwrap_or(8),
         }
         .validate()?;
         // Compact mode stores one cell per video pixel at cell resolution;
         // the padded cells carry stream data just like any other cell.
-        let (crf, preset, parity) = match self.compress {
+        let (crf, preset, parity) = match self.compress.or(config.compress) {
             None => (8, "faster", 32),
             Some(Profile::Light) => (8, "slow", 64),
             Some(Profile::Medium) => (8, "slower", 32),
@@ -208,16 +230,24 @@ impl Encoding {
             video::Settings {
                 grid,
                 display,
-                fps: self.fps,
-                crf: self.crf.unwrap_or(crf),
-                preset: self.preset.unwrap_or_else(|| preset.to_owned()),
+                fps: self.fps.or(config.fps).unwrap_or(30),
+                crf: self.crf.or(config.crf).unwrap_or(crf),
+                preset: self
+                    .preset
+                    .clone()
+                    .or_else(|| config.preset.clone())
+                    .unwrap_or_else(|| preset.to_owned()),
                 cell_bits: 4,
                 compact: true,
-                chroma: self.chroma,
-                intra: self.intra,
+                chroma: self.chroma.or(config.chroma).unwrap_or(false),
+                intra: self.intra.or(config.intra).unwrap_or(false),
             },
-            self.ecc_symbols.map_or(parity, usize::from),
-            self.pbkdf2_iterations,
+            self.ecc_symbols
+                .or(config.ecc_symbols)
+                .map_or(parity, usize::from),
+            self.pbkdf2_iterations
+                .or(config.pbkdf2_iterations)
+                .unwrap_or(600_000),
         ))
     }
 }
@@ -233,6 +263,14 @@ fn temporary(dir: &Path) -> Result<NamedTempFile> {
         .prefix(".file2video-")
         .tempfile_in(dir)
         .with_context(|| format!("could not create a temporary file in {}", dir.display()))
+}
+
+fn mode_name(intra: bool, chroma: bool) -> &'static str {
+    MODES
+        .iter()
+        .find(|(_, i, c)| *i == intra && *c == chroma)
+        .map(|(label, _, _)| *label)
+        .unwrap_or("custom")
 }
 
 fn check_output(path: &Path) -> Result<()> {
@@ -260,9 +298,9 @@ fn encode(
     output: &Path,
     password: Password,
     options: Encoding,
-    quiet: bool,
+    ctx: &Ctx,
 ) -> Result<u64> {
-    let (settings, parity, iterations) = options.resolve()?;
+    let (settings, parity, iterations) = options.resolve(ctx.config)?;
     check_output(output)?;
     regular_file_len(fs::metadata(input)?)?;
     let file = File::open(input)?;
@@ -281,8 +319,16 @@ fn encode(
     let password = password.get(true)?;
     let mut crypto = crypto::Stream::new(&header, &password);
     drop(password);
+
+    let mut tools = tools.clone();
+    let original_gpu = tools.gpu;
+    let fallback = settings.clone();
+    let settings = apply_optimisation(&mut tools, &settings, &options, ctx);
+    let replaced = settings.chroma != fallback.chroma
+        || settings.intra != fallback.intra
+        || tools.gpu != original_gpu;
     let frames = layout.frames(settings.grid, settings.cell_bits, settings.chroma);
-    if !quiet {
+    if !ctx.quiet {
         eprintln!(
             "Encrypting {size} bytes; writing {frames} video frames ({} luma levels per cell{}).",
             1 << settings.cell_bits,
@@ -323,40 +369,187 @@ fn encode(
         "input file grew while encoding"
     );
     (header.tag, header.hash) = crypto.finish()?;
-    staged.rewind()?;
-    let bytes = header.bytes();
-    let encrypted = bytes.as_slice().chain(staged);
+    let ecc_header = layout.ecc_header(parity);
+    let mut written = None;
+    let mut attempt = settings;
+    for round in 0..2 {
+        staged.rewind()?;
+        let bytes = header.bytes();
+        let attempt_frames = layout.frames(attempt.grid, attempt.cell_bits, attempt.chroma);
+        let mut stream = bytes.as_slice().chain(&mut staged);
+        match write_video(
+            &tools,
+            &attempt,
+            dir,
+            parity,
+            layout.protected,
+            attempt_frames,
+            &ecc_header,
+            layout.encrypted,
+            &mut stream,
+        ) {
+            Ok(tmp) => {
+                written = Some(tmp);
+                break;
+            }
+            Err(error) => {
+                if round == 0 && replaced {
+                    eprintln!(
+                        "Warning: the optimised video mode failed ({error:#}); retrying with {} and {}.",
+                        original_gpu.short_name(),
+                        mode_name(fallback.intra, fallback.chroma),
+                    );
+                    attempt = fallback.clone();
+                    tools.gpu = original_gpu;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    publish(written.expect("a video write attempt succeeded"), output)?;
+    Ok(frames)
+}
 
-    let tmp = temporary(dir)?;
-    let mut process = tools.encode(&settings, tmp.path())?;
-    let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
-    let mut sink = video::Sink::new(pipe, settings.grid, settings.chroma, frames);
-    sink.push(&format::transport(
+#[allow(clippy::too_many_arguments)]
+fn write_video<R: Read>(
+    tools: &video::Tools,
+    settings: &video::Settings,
+    dir: &Path,
+    parity: usize,
+    protected: u64,
+    frames: u64,
+    ecc_header: &[u8],
+    stream_len: u64,
+    stream: R,
+) -> Result<NamedTempFile> {
+    let transport = format::transport(
         settings.display,
         parity,
-        layout.protected,
+        protected,
         settings.cell_bits,
         settings.compact,
         settings.chroma,
-    ))?;
-    let codec = ecc::Codec::new(parity);
-    if settings.compact {
-        // In compact mode the ECC header leads the first Reed-Solomon word's
-        // data, so parity protects it against quantization noise too.
-        let ecc_header = layout.ecc_header(parity);
-        codec.encode(
-            ecc_header.as_slice().chain(encrypted),
-            ECC_SIZE as u64 + layout.encrypted,
-            |data| sink.push(data),
-        )?;
-    } else {
-        sink.push(&layout.ecc_header(parity))?;
-        codec.encode(encrypted, layout.encrypted, |data| sink.push(data))?;
+    );
+    let tmp = temporary(dir)?;
+    (|| -> Result<NamedTempFile> {
+        let mut process = tools.encode(settings, tmp.path())?;
+        let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
+        let pushed = (|| -> Result<()> {
+            let mut sink = video::Sink::new(pipe, settings.grid, settings.chroma, frames);
+            sink.push(&transport)?;
+            let codec = ecc::Codec::new(parity);
+            if settings.compact {
+                // In compact mode the ECC header leads the first
+                // Reed-Solomon word's data, so parity protects it against
+                // quantization noise too.
+                codec.encode(
+                    ecc_header.chain(stream),
+                    ECC_SIZE as u64 + stream_len,
+                    |data| sink.push(data),
+                )?;
+            } else {
+                sink.push(ecc_header)?;
+                codec.encode(stream, stream_len, |data| sink.push(data))?;
+            }
+            sink.finish()?;
+            Ok(())
+        })();
+        if let Err(error) = pushed {
+            return Err(process.explain(error));
+        }
+        process.finish()?;
+        Ok(tmp)
+    })()
+}
+
+fn quick_calibration(tools: &video::Tools, options: &Encoding, ctx: &Ctx) -> Result<Calibration> {
+    let temp = tempfile::tempdir().context("could not create a calibration directory")?;
+    let payload = temp.path().join("calibration.bin");
+    generate_payload(&payload, CALIBRATION_PAYLOAD_MIB)?;
+    eprintln!(
+        "Calibrating the encoders with {:.0} MiB of generated payload...",
+        CALIBRATION_PAYLOAD_MIB
+    );
+    let bytes = regular_file_len(fs::metadata(&payload)?)?;
+    let rows = run_matrix(tools, &payload, bytes, options, ctx);
+    let calibration = calibration_from(diag::fingerprint(&tools.ffmpeg), &rows);
+    if let Err(error) = calibration.save(ctx.calibration) {
+        eprintln!(
+            "Warning: the calibration could not be saved ({error:#}); the results are used for this run only."
+        );
     }
-    sink.finish()?;
-    process.finish()?;
-    publish(tmp, output)?;
-    Ok(frames)
+    Ok(calibration)
+}
+
+/// Rewrites the settings with the best measured backend and frame mode for
+/// this machine, calibrating on the fly when the saved results are missing
+/// or refer to different hardware. `Off` keeps the configured settings.
+fn apply_optimisation(
+    tools: &mut video::Tools,
+    settings: &video::Settings,
+    options: &Encoding,
+    ctx: &Ctx,
+) -> video::Settings {
+    let target = options.optimise_target(ctx.config);
+    if target == Target::Off {
+        return settings.clone();
+    }
+    if !ctx.quiet {
+        eprintln!("Optimising video encoding for {}...", target.label());
+    }
+    let fingerprint = diag::fingerprint(&tools.ffmpeg);
+    let calibration = match Calibration::load(ctx.calibration) {
+        Ok(Some(saved)) if saved.is_fresh(&fingerprint) => saved,
+        _ => match quick_calibration(tools, options, ctx) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                eprintln!(
+                    "Warning: calibration failed ({error:#}); using the configured settings."
+                );
+                return settings.clone();
+            }
+        },
+    };
+    let chosen = match calibration.choose(
+        target,
+        forced_backend(tools.gpu),
+        options.intra,
+        options.chroma,
+    ) {
+        Some(measurement) => measurement,
+        None => {
+            if !ctx.quiet {
+                eprintln!(
+                    "No measured candidate matches the configured settings; keeping {} {}.",
+                    tools.gpu.short_name(),
+                    mode_name(settings.intra, settings.chroma)
+                );
+            }
+            return settings.clone();
+        }
+    };
+    if !ctx.quiet {
+        eprintln!(
+            "Using {}{} for this machine ({:.2}s per {:.0} MiB, {:.0}% file size in the benchmark).",
+            chosen.backend,
+            match mode_name(chosen.intra, chosen.chroma) {
+                "base" => String::new(),
+                label => format!(" {label}"),
+            },
+            chosen.encode_s + chosen.decode_s,
+            chosen.payload as f64 / (1024.0 * 1024.0),
+            (chosen.mp4 as f64 / chosen.payload.max(1) as f64) * 100.0
+        );
+    }
+    if let Some(backend) = video::Gpu::from_name(&chosen.backend) {
+        tools.gpu = backend;
+    }
+    video::Settings {
+        chroma: chosen.chroma,
+        intra: chosen.intra,
+        ..settings.clone()
+    }
 }
 
 fn restorable_name(name: &str) -> Result<&str> {
@@ -487,8 +680,32 @@ fn decode(
     Ok(destination)
 }
 
-fn estimate(input: &Path, options: Encoding) -> Result<()> {
-    let (settings, parity, _) = options.resolve()?;
+fn estimate(tools: &video::Tools, input: &Path, options: Encoding, ctx: &Ctx) -> Result<()> {
+    let target = options.optimise_target(ctx.config);
+    let mut optimise_note: Option<String> = None;
+    if target != Target::Off {
+        let fingerprint = diag::fingerprint(&tools.ffmpeg);
+        optimise_note = Some(match Calibration::load(ctx.calibration) {
+            Ok(Some(saved)) if saved.is_fresh(&fingerprint) => {
+                let forced = forced_backend(tools.gpu);
+                match saved.choose(target, forced, options.intra, options.chroma) {
+                    Some(measurement) => format!(
+                        "Optimising for {} would use: {} {}.",
+                        target.label(),
+                        measurement.backend,
+                        mode_name(measurement.intra, measurement.chroma)
+                    ),
+                    None => "No measured candidate matches these settings; run `file2video benchmark` with the same flags first.".to_owned(),
+                }
+            }
+            Ok(None) => "The calibration file does not exist yet; run `file2video benchmark` to measure this machine.".to_owned(),
+            Ok(Some(_)) => "The calibration file refers to other hardware; run `file2video benchmark` to measure this machine again.".to_owned(),
+            Err(error) => format!(
+                "The calibration file could not be read ({error:#}); run `file2video benchmark` to recreate it."
+            ),
+        });
+    }
+    let (settings, parity, _) = options.resolve(ctx.config)?;
     let size = regular_file_len(fs::metadata(input)?)?;
     let metadata = format::metadata(input, size)?.len() as u64;
     let encrypted = size
@@ -527,7 +744,18 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
         settings.fps
     );
     println!("MP4 file size depends on H.264 compression and cannot be predicted exactly.");
+    if let Some(note) = optimise_note {
+        println!("{note}");
+    }
     Ok(())
+}
+
+fn forced_backend(gpu: video::Gpu) -> Option<&'static str> {
+    if gpu == video::Gpu::Auto {
+        None
+    } else {
+        Some(gpu.short_name())
+    }
 }
 
 fn generate_payload(path: &Path, mib: u64) -> Result<u64> {
@@ -576,11 +804,191 @@ fn files_equal(a: &Path, b: &Path) -> Result<bool> {
     }
 }
 
+enum Row {
+    Measured(calibrate::Measurement),
+    Failed {
+        failure: calibrate::Failure,
+        error: String,
+    },
+}
+
+/// Every usable backend for the current `--gpu` choice, ending with the
+/// CPU fallback.
+fn backend_list(tools: &video::Tools) -> Vec<(&'static str, video::Gpu)> {
+    let mut backends: Vec<(&'static str, video::Gpu)> = Vec::new();
+    if tools.gpu != video::Gpu::Off {
+        if tools.gpu == video::Gpu::Auto {
+            for backend in tools.available_backends() {
+                backends.push((backend.short_name(), backend));
+            }
+        } else {
+            backends.push((tools.gpu.short_name(), tools.gpu));
+        }
+    }
+    backends.push(("cpu", video::Gpu::Off));
+    backends
+}
+
+/// Encodes and decodes the payload with every backend x frame-mode
+/// combination, returning one row per combination. This is the shared engine
+/// for `benchmark` and for the automatic calibration inside `encode`.
+fn run_matrix(
+    tools: &video::Tools,
+    payload: &Path,
+    bytes: u64,
+    base: &Encoding,
+    ctx: &Ctx,
+) -> Vec<Row> {
+    let quiet = Ctx {
+        config: ctx.config,
+        calibration: ctx.calibration,
+        quiet: true,
+    };
+    let temp = match tempfile::tempdir() {
+        Ok(temp) => temp,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for (name, gpu) in backend_list(tools) {
+        let run_tools = video::Tools {
+            ffmpeg: tools.ffmpeg.clone(),
+            ffprobe: tools.ffprobe.clone(),
+            threads: tools.threads,
+            gpu,
+        };
+        for (_, intra, chroma) in MODES {
+            let mut bench = base.clone();
+            bench.optimise = Some(Target::Off);
+            bench.intra = Some(intra);
+            bench.chroma = Some(chroma);
+            bench.crf = None;
+            bench.pbkdf2_iterations = Some(1000);
+            let run = rows.len() + 1;
+            let video_path = temp.path().join(format!("bench-{run}.mp4"));
+            let restored = temp.path().join(format!("restored-{run}"));
+            let started = Instant::now();
+            let outcome = encode(
+                &run_tools,
+                payload,
+                &video_path,
+                password_for("file2video benchmark"),
+                bench,
+                &quiet,
+            )
+            .map(|frames| {
+                let encode_time = started.elapsed().as_secs_f64();
+                let mp4 = fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
+                let decode_started = Instant::now();
+                decode(
+                    &run_tools,
+                    &video_path,
+                    &restored,
+                    password_for("file2video benchmark"),
+                    DecodeOptions {
+                        restore_name: false,
+                        width: None,
+                        height: None,
+                        block: None,
+                    },
+                )
+                .map(|_| {
+                    let decode_time = decode_started.elapsed().as_secs_f64();
+                    (frames, encode_time, decode_time, mp4)
+                })
+            });
+            match outcome {
+                Ok(Ok((frames, encode_time, decode_time, mp4))) => {
+                    if files_equal(payload, &restored).unwrap_or(false) {
+                        rows.push(Row::Measured(calibrate::Measurement {
+                            backend: name.to_owned(),
+                            intra,
+                            chroma,
+                            frames,
+                            payload: bytes,
+                            encode_s: encode_time,
+                            decode_s: decode_time,
+                            mp4,
+                        }));
+                    } else {
+                        rows.push(Row::Failed {
+                            failure: calibrate::Failure {
+                                backend: name.to_owned(),
+                                intra,
+                                chroma,
+                            },
+                            error: "decoded output does not match the payload".to_owned(),
+                        });
+                    }
+                }
+                Ok(Err(error)) | Err(error) => rows.push(Row::Failed {
+                    failure: calibrate::Failure {
+                        backend: name.to_owned(),
+                        intra,
+                        chroma,
+                    },
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+    }
+    rows
+}
+
+fn as_table(rows: &[Row], bytes: u64) {
+    for row in rows {
+        match row {
+            Row::Measured(measurement) => println!(
+                "{:<22} {:<15} {:>7} {:>8.2}s {:>10} {:>8.2}s {:>10} {:>8} MB {:>6}%",
+                measurement.backend,
+                mode_name(measurement.intra, measurement.chroma),
+                measurement.frames,
+                measurement.encode_s,
+                speed(bytes, measurement.encode_s),
+                measurement.decode_s,
+                speed(bytes, measurement.decode_s),
+                format!("{:.1}", measurement.mp4 as f64 / (1024.0 * 1024.0)),
+                format!("{:.0}", (measurement.mp4 as f64 / bytes as f64) * 100.0)
+            ),
+            Row::Failed { failure, error } => {
+                println!(
+                    "{:<22} {:<15} {:>7} {:>8} {:>10} {:>8} {:>10} {:>8} MB {:>6}%",
+                    failure.backend,
+                    mode_name(failure.intra, failure.chroma),
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-"
+                );
+                eprintln!(
+                    "{} {}: {error}",
+                    failure.backend,
+                    mode_name(failure.intra, failure.chroma)
+                );
+            }
+        }
+    }
+}
+
+fn calibration_from(fingerprint: String, rows: &[Row]) -> Calibration {
+    let mut calibration = Calibration::new(fingerprint);
+    for row in rows {
+        match row {
+            Row::Measured(measurement) => calibration.measurements.push(measurement.clone()),
+            Row::Failed { failure, .. } => calibration.failures.push(failure.clone()),
+        }
+    }
+    calibration
+}
+
 fn benchmark(
     tools: &video::Tools,
     input: Option<PathBuf>,
     size: u64,
     options: Encoding,
+    ctx: &Ctx,
 ) -> Result<()> {
     let temp = tempfile::tempdir().context("could not create a benchmark directory")?;
     let payload: PathBuf = match input {
@@ -593,23 +1001,11 @@ fn benchmark(
         }
     };
     let bytes = regular_file_len(fs::metadata(&payload)?)?;
-    let mut backends: Vec<(String, video::Gpu)> = Vec::new();
-    if tools.gpu != video::Gpu::Off {
-        if tools.gpu == video::Gpu::Auto {
-            for backend in tools.available_backends() {
-                backends.push((backend.encoder_name().to_owned(), backend));
-            }
-        } else {
-            backends.push((tools.gpu.encoder_name().to_owned(), tools.gpu));
-        }
-    }
-    backends.push(("cpu (libx264)".to_owned(), video::Gpu::Off));
-
     println!(
         "Payload: {:.1} MB | {} fps | {} parity symbols | CRF cap 8 (intra: 6)",
         bytes as f64 / (1024.0 * 1024.0),
-        options.fps,
-        options.ecc_symbols.unwrap_or(32)
+        options.fps.or(ctx.config.fps).unwrap_or(30),
+        options.ecc_symbols.or(ctx.config.ecc_symbols).unwrap_or(32)
     );
     println!(
         "{:<22} {:<15} {:>7} {:>9} {:>10} {:>9} {:>10} {:>10} {:>7}",
@@ -623,97 +1019,15 @@ fn benchmark(
         "MP4",
         "Result"
     );
-    let mut run = 0usize;
-    let modes: [(&str, bool, bool); 4] = [
-        ("base", false, false),
-        ("intra", true, false),
-        ("chroma", false, true),
-        ("intra+chroma", true, true),
-    ];
-    for (name, gpu) in &backends {
-        let run_tools = video::Tools {
-            ffmpeg: tools.ffmpeg.clone(),
-            ffprobe: tools.ffprobe.clone(),
-            threads: tools.threads,
-            gpu: *gpu,
-        };
-        for (label, intra, chroma) in modes {
-            let mut bench = options.clone();
-            bench.intra = intra;
-            bench.chroma = chroma;
-            bench.crf = None;
-            bench.pbkdf2_iterations = 1000;
-            run += 1;
-            let video_path = temp.path().join(format!("bench-{run}.mp4"));
-            let restored = temp.path().join(format!("restored-{run}"));
-            let started = Instant::now();
-            let outcome = match encode(
-                &run_tools,
-                &payload,
-                &video_path,
-                Password {
-                    password: Some("file2video benchmark".to_owned()),
-                    password_file: None,
-                },
-                bench,
-                true,
-            ) {
-                Ok(frames) => {
-                    let encode_time = started.elapsed().as_secs_f64();
-                    let mp4 = fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
-                    let decode_started = Instant::now();
-                    match decode(
-                        &run_tools,
-                        &video_path,
-                        &restored,
-                        Password {
-                            password: Some("file2video benchmark".to_owned()),
-                            password_file: None,
-                        },
-                        DecodeOptions {
-                            restore_name: false,
-                            width: None,
-                            height: None,
-                            block: None,
-                        },
-                    ) {
-                        Ok(_) => {
-                            let decode_time = decode_started.elapsed().as_secs_f64();
-                            let verified = files_equal(&payload, &restored)?;
-                            if !verified {
-                                Err(anyhow::anyhow!("decoded output does not match the payload"))
-                            } else {
-                                Ok((frames, encode_time, decode_time, mp4))
-                            }
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            };
-            match outcome {
-                Ok((frames, encode_time, decode_time, mp4)) => println!(
-                    "{:<22} {:<15} {:>7} {:>8.2}s {:>10} {:>8.2}s {:>10} {:>8} MB {:>6}%",
-                    name,
-                    label,
-                    frames,
-                    encode_time,
-                    speed(bytes, encode_time),
-                    decode_time,
-                    speed(bytes, decode_time),
-                    format!("{:.1}", mp4 as f64 / (1024.0 * 1024.0)),
-                    format!("{:.0}", (mp4 as f64 / bytes as f64) * 100.0)
-                ),
-                Err(error) => {
-                    println!(
-                        "{:<22} {:<15} {:>7} {:>8} {:>10} {:>8} {:>10} {:>8} MB {:>6}%",
-                        name, label, "-", "-", "-", "-", "-", "-", "-"
-                    );
-                    eprintln!("{name} {label}: {error:#}");
-                }
-            }
-        }
-    }
+    let rows = run_matrix(tools, &payload, bytes, &options, ctx);
+    as_table(&rows, bytes);
+    calibration_from(diag::fingerprint(&tools.ffmpeg), &rows)
+        .save(ctx.calibration)
+        .with_context(|| format!("could not save {}", ctx.calibration.display()))?;
+    eprintln!(
+        "Calibration results saved to {}; encode with --optimise smallest|fastest|balanced to use them.",
+        ctx.calibration.display()
+    );
     Ok(())
 }
 
@@ -722,18 +1036,23 @@ fn uses_video(cli: &Cli) -> bool {
     !matches!(cli.command, Operation::Estimate { .. })
 }
 
-fn pick_ffmpeg(cli: &Cli) -> PathBuf {
+fn pick_ffmpeg(cli: &Cli, gpu: video::Gpu) -> PathBuf {
     if let Some(path) = &cli.ffmpeg {
         return path.clone();
     }
-    let default = PathBuf::from(video::default_ffmpeg());
-    if cli.no_download || !uses_video(cli) {
-        return default;
+    if cli.no_download {
+        return PathBuf::from(video::default_ffmpeg());
     }
+    let default = PathBuf::from(video::default_ffmpeg());
     let full_build = download::ffmpeg_works(&default)
-        && (cli.gpu == video::Gpu::Off || download::has_hardware_encoders(&default));
+        && (gpu == video::Gpu::Off || download::has_hardware_encoders(&default));
     if full_build {
         return default;
+    }
+    if !uses_video(cli) {
+        // Estimation must never download; an existing cached build still
+        // matches the fingerprint of a real encode run.
+        return download::cached().unwrap_or(default);
     }
     match download::install() {
         Ok(path) => path,
@@ -746,17 +1065,27 @@ fn pick_ffmpeg(cli: &Cli) -> PathBuf {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    ensure!(cli.threads <= 256, "--threads must be in 0..=256");
+    let config = Config::load(cli.config.as_deref())?;
+    let threads = cli.threads.or(config.threads).unwrap_or(0);
+    let calibration = cli
+        .calibration
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(calibrate::FILE_NAME));
+    let ctx = Ctx {
+        config: &config,
+        calibration: &calibration,
+        quiet: false,
+    };
     let with_video = uses_video(&cli);
     let tools = video::Tools {
-        ffmpeg: pick_ffmpeg(&cli),
+        ffmpeg: pick_ffmpeg(&cli, cli.gpu.or(config.gpu).unwrap_or(video::Gpu::Auto)),
         ffprobe: cli.ffprobe,
-        threads: cli.threads,
-        gpu: cli.gpu,
+        threads,
+        gpu: cli.gpu.or(config.gpu).unwrap_or(video::Gpu::Auto),
     };
-    if cli.threads != 0 {
+    if threads != 0 {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(cli.threads)
+            .num_threads(threads)
             .build_global()?;
     }
     if with_video {
@@ -770,7 +1099,7 @@ fn run() -> Result<()> {
             password,
             settings,
         } => {
-            encode(&tools, &input, &output, password, settings, false)?;
+            encode(&tools, &input, &output, password, settings, &ctx)?;
             eprintln!(
                 "Wrote {} in {:.2}s.",
                 output.display(),
@@ -804,12 +1133,12 @@ fn run() -> Result<()> {
                 start.elapsed().as_secs_f64()
             );
         }
-        Operation::Estimate { input, settings } => estimate(&input, settings)?,
+        Operation::Estimate { input, settings } => estimate(&tools, &input, settings, &ctx)?,
         Operation::Benchmark {
             input,
             size,
             settings,
-        } => benchmark(&tools, input, size, settings)?,
+        } => benchmark(&tools, input, size, settings, &ctx)?,
     }
     Ok(())
 }

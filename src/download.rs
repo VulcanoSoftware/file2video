@@ -19,6 +19,13 @@ pub const HARDWARE_ENCODERS: [&str; 5] = [
     "h264_videotoolbox",
 ];
 
+// Returns the cached downloaded full build when one already exists, without
+// downloading anything (used by commands that must not touch the network).
+pub fn cached() -> Option<PathBuf> {
+    let ffmpeg = cache_dir().join(executable("ffmpeg"));
+    (fs::metadata(&ffmpeg).is_ok() && ffmpeg_works(&ffmpeg)).then_some(ffmpeg)
+}
+
 pub fn ffmpeg_works(path: &Path) -> bool {
     Command::new(path)
         .args(["-hide_banner", "-version"])

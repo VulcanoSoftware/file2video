@@ -93,6 +93,37 @@ pub fn gpu_names() -> Vec<String> {
     gpu().unwrap_or_default()
 }
 
+fn cpu_name() -> Option<String> {
+    cpu().filter(|name| !name.trim().is_empty())
+}
+
+/// The coreset of the specs recorded in the calibration file. A change in any
+/// component (hardware, driver, core count, or FFmpeg build) changes the
+/// fingerprint, so a saved calibration is automatically considered stale.
+pub fn fingerprint(ffmpeg: &Path) -> String {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let mut parts = vec![
+        std::env::consts::OS.to_owned(),
+        std::env::consts::ARCH.to_owned(),
+        cpu_name().unwrap_or_else(|| "unknown cpu".to_owned()),
+        cores.to_string(),
+    ];
+    let gpus = gpu_names();
+    parts.push(if gpus.is_empty() {
+        "gpu unknown".to_owned()
+    } else {
+        format!("gpus: {}", gpus.join("; "))
+    });
+    if let Some(summary) = ffmpeg_summary(ffmpeg) {
+        parts.push(summary);
+    } else {
+        parts.push("ffmpeg unknown".to_owned());
+    }
+    parts.join(" | ")
+}
+
 fn gpu() -> Option<Vec<String>> {
     if cfg!(target_os = "linux") {
         command_output(Command::new("lspci").args(["-nn", "-d", "::03xx"])).map(|text| {

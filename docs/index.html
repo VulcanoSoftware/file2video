@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>file2video — config generator</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --accent: #2f81f7; --ok: #3fb950; --warn: #d29922;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); padding: 2rem; }
+  header { max-width: 1100px; margin: 0 auto 1.5rem; }
+  h1 { margin: 0 0 .4rem; font-size: 1.6rem; }
+  p.lead { margin: 0; color: var(--muted); max-width: 60rem; line-height: 1.5; }
+  .layout { max-width: 1100px; margin: 0 auto; display: grid; gap: 1.5rem; grid-template-columns: 1fr 1fr; align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  section.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem 1.5rem; }
+  h2 { margin: 0 0 1rem; font-size: 1.05rem; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin: .9rem 0 .25rem; }
+  label b { color: var(--text); font-weight: 600; }
+  select, input[type="text"], input[type="number"] {
+    width: 100%; padding: .45rem .6rem; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: .9rem;
+  }
+  .row { display: grid; gap: 1rem; grid-template-columns: 1fr 1fr; }
+  .check { display: flex; align-items: center; gap: .5rem; margin: .9rem 0 .25rem; font-size: .9rem; }
+  .check input { width: auto; }
+  .hint { font-size: .78rem; color: var(--muted); margin-top: .2rem; }
+  textarea {
+    width: 100%; min-height: 260px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: .85rem; padding: .75rem; resize: vertical;
+  }
+  .actions { display: flex; gap: .75rem; margin-top: 1rem; flex-wrap: wrap; }
+  button { padding: .5rem 1rem; border-radius: 6px; border: 1px solid var(--border); background: var(--accent); color: #fff; font-size: .9rem; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--text); }
+  button.copied { background: var(--ok); }
+  .note { border-left: 3px solid var(--warn); background: rgba(210,153,34,.08); padding: .6rem .9rem; font-size: .83rem; color: var(--muted); border-radius: 0 6px 6px 0; margin-top: 1rem; line-height: 1.45; }
+  code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: .05rem .3rem; font-size: .8rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>file2video config generator</h1>
+  <p class="lead">Build a <code>file2video.conf</code> file for the <code>file2video</code> CLI.
+  Drop it in the directory where you run the program (or pass <code>--config &lt;PATH&gt;</code>) and every
+  value below becomes a default for <code>encode</code>, <code>decode</code>, <code>estimate</code> and
+  <code>benchmark</code>. Command-line flags always override this file. Encrypting with a password is
+  always on; everything here is optional tuning.</p>
+</header>
+
+<div class="layout">
+  <section class="panel">
+    <h2>Video layout</h2>
+    <div class="row">
+      <div>
+        <label for="width"><b>width</b> — nominal video width (px)</label>
+        <input type="number" id="width" placeholder="1920" min="256" step="1">
+      </div>
+      <div>
+        <label for="height"><b>height</b> — nominal video height (px)</label>
+        <input type="number" id="height" placeholder="1080" min="256" step="1">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="block_size"><b>block_size</b> — pixels per data cell</label>
+        <input type="number" id="block_size" placeholder="8" min="1" step="1">
+      </div>
+      <div>
+        <label for="fps"><b>fps</b> — playback speed (1–60)</label>
+        <input type="number" id="fps" placeholder="30" min="1" max="60" step="1">
+      </div>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="chroma">
+      <span><b>chroma</b> — also store data in the U/V chroma planes (+50% capacity per frame)</span>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="intra">
+      <span><b>intra</b> — every frame is a keyframe (good for bad broadcast conditions)</span>
+    </div>
+
+    <h2 style="margin-top:1.6rem">Quality &amp; speed</h2>
+    <div class="row">
+      <div>
+        <label for="compress"><b>compress</b> — compression profile</label>
+        <select id="compress">
+          <option value="">(default: medium)</option>
+          <option value="light">light — fast, extra recovery margin</option>
+          <option value="medium">medium — balanced</option>
+          <option value="high">high — smallest videos, tighter margin</option>
+        </select>
+      </div>
+      <div>
+        <label for="crf"><b>crf</b> — x264 quality (0–51, default 8)</label>
+        <input type="number" id="crf" placeholder="8" min="0" max="51" step="1">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="preset"><b>preset</b> — x264 speed/size preset</label>
+        <select id="preset">
+          <option value="">(default: faster, or set by compress)</option>
+          <option>ultrafast</option><option>superfast</option><option>veryfast</option>
+          <option>faster</option><option>fast</option><option>medium</option>
+          <option>slow</option><option>slower</option><option>veryslow</option>
+        </select>
+      </div>
+      <div>
+        <label for="ecc_symbols"><b>ecc_symbols</b> — Reed-Solomon parity per codeword (1–127)</label>
+        <input type="number" id="ecc_symbols" placeholder="32" min="1" max="127" step="1">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="pbkdf2_iterations"><b>pbkdf2_iterations</b> — PBKDF2-HMAC-SHA256 rounds (min 600000 recommended)</label>
+        <input type="number" id="pbkdf2_iterations" placeholder="600000" min="1" step="1">
+      </div>
+      <div>
+        <label for="threads"><b>threads</b> — thread limit, 0 = automatic</label>
+        <input type="number" id="threads" placeholder="0" min="0" max="256" step="1">
+      </div>
+    </div>
+
+    <h2 style="margin-top:1.6rem">Hardware</h2>
+    <div class="row">
+      <div>
+        <label for="gpu"><b>gpu</b> — hardware H.264 encoder</label>
+        <select id="gpu">
+          <option value="">auto — detect and trial-test the GPUs of this machine</option>
+          <option value="off">off — CPU encoder (libx264)</option>
+          <option value="amf">amf — AMD</option>
+          <option value="nvenc">nvenc — NVIDIA</option>
+          <option value="qsv">qsv — Intel</option>
+          <option value="vaapi">vaapi — Linux VAAPI</option>
+          <option value="video-toolbox">video-toolbox — macOS</option>
+        </select>
+      </div>
+      <div>
+        <label for="optimise"><b>optimise</b> — use the saved calibration to pick the best encoding</label>
+        <select id="optimise">
+          <option value="">off — always use the settings above</option>
+          <option value="smallest">smallest — minimum video file size</option>
+          <option value="fastest">fastest — minimum encode+decode time</option>
+          <option value="balanced">balanced — best combination of both</option>
+        </select>
+      </div>
+    </div>
+    <div class="note">
+      <b>Encryption.</b> Video files are always encrypted with a password (AES-GCM +
+      PBKDF2). There is deliberately no way to disable this: the video files travel
+      through YouTube and other platforms and must stay private. Tuning the work factor
+      with <b>pbkdf2_iterations</b> is the supported way to make encoding cheaper or
+      stronger.
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>file2video.conf</h2>
+    <textarea id="output" readonly spellcheck="false"></textarea>
+    <div class="actions">
+      <button id="copy">Copy to clipboard</button>
+      <button id="download" class="secondary">Download file</button>
+    </div>
+    <p class="hint">
+      Save this as <code>file2video.conf</code> next to <code>file2video.exe</code> / in your working
+      directory, or pass it explicitly with <code>--config file2video.conf</code>. The encoder also
+      keeps its benchmark results in <code>file2video-calibration.conf</code>; with
+      <code>optimise</code> set, it reuses them automatically and re-calibrates whenever your
+      hardware changes.
+    </p>
+  </section>
+</div>
+
+<script>
+  const FIELDS = ["width", "height", "block_size", "fps", "compress", "crf", "preset",
+    "ecc_symbols", "pbkdf2_iterations", "threads", "chroma", "intra", "gpu", "optimise"];
+
+  const el = (id) => document.getElementById(id);
+
+  function lines() {
+    const out = [];
+    out.push("# file2video configuration");
+    out.push("# Place in the working directory, or pass --config <PATH>.");
+    out.push("# Every key is optional; command-line flags always win.");
+    for (const field of FIELDS) {
+      const node = el(field);
+      let value;
+      if (node.type === "checkbox") {
+        if (!node.checked) continue;
+        value = "on";
+      } else if (node.value === "") {
+        continue;
+      } else {
+        value = node.value;
+      }
+      const title = node.labels && node.labels[0]?.querySelector("b")
+        ? node.labels[0].querySelector("b").textContent
+        : field;
+      out.push("");
+      out.push("# " + title);
+      out.push(field + " = " + value);
+    }
+    return out;
+  }
+
+  function render() {
+    el("output").value = lines().join("\n") + "\n";
+  }
+
+  FIELDS.forEach((field) => {
+    el(field).addEventListener("input", render);
+    el(field).addEventListener("change", render);
+  });
+
+  el("copy").addEventListener("click", async (event) => {
+    const button = event.target;
+    try {
+      await navigator.clipboard.writeText(el("output").value);
+    } catch {
+      el("output").select();
+      document.execCommand("copy");
+    }
+    button.textContent = "Copied!";
+    button.classList.add("copied");
+    setTimeout(() => { button.textContent = "Copy to clipboard"; button.classList.remove("copied"); }, 1500);
+  });
+
+  el("download").addEventListener("click", () => {
+    const blob = new Blob([el("output").value], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "file2video.conf";
+    link.click();
+    URL.revokeObjectURL(url);
+  });
+
+  render();
+</script>
+</body>
+</html>
