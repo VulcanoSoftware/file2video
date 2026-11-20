@@ -80,7 +80,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--compress` | off | Smaller-output profile: `light`, `medium` or `high`. |
 | `--pbkdf2-iterations` | `600000` | PBKDF2-HMAC-SHA256 iterations (1–10,000,000). |
 | `--no-password` | off | Store the file without encryption: anyone who downloads the video can read it. A SHA-256 integrity check still protects against damaged videos; decoding never asks for a password. |
-| `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). |
+| `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). In stealth mode only the backend and all-intra choice apply. |
 | `--stealth <VIDEO>` | off | Hide the data as a faint luma layer over a background video instead of storing cells; decoding is blind and does not need that video again. See [Stealth mode](#stealth-mode). |
 | `--stealth-block <PIXELS>` | `6` | Stealth mode only: modulation block size (even, 2–16). Smaller blocks carry more data per frame and encode proportionally faster; see [Stealth mode](#stealth-mode). |
 
@@ -157,7 +157,7 @@ Example: encode a 1 GiB archive as a stealth layer at 2.25x the default density:
 
 Limitations:
 
-- An explicit `--chroma` (the colour planes carry the background colours) or an explicit `--optimise` (calibration profiles only cover the cell format) on the command line cannot be combined with `--stealth`; a `chroma = on` or `optimise = ...` default from the configuration file is ignored with a warning, so a config tuned for cell encodes never blocks a stealth encode.
+- A `--chroma` request (explicit flag or config default) is ignored with a warning: the chroma planes carry the background colours. An `--optimise` target (explicit flag or config default) does apply to stealth: the calibrated encoder backend and all-intra choice are used, only its chroma part never is. The profiles were measured on the cell format, so the choice is a hardware-level hint for stealth encodes rather than an exact stealth measurement; a warning says as much, and a `chroma = on` / `optimise = ...` config tuned for cell encodes never blocks a stealth encode.
 - `estimate` and `benchmark` have no stealth support; use them in normal mode only.
 - The 8-byte sync marker and the transport header are outside the Reed-Solomon protection. If the opening frames of the video are damaged so badly that anchors or header cannot be parsed, decoding stops; the file payload itself enjoys the full parity budget.
 - Capacity per frame is much lower than the cell format (a 1920×1080 frame holds ~3.5 KB instead of ~130 KB), so the same file takes far more playback duration in stealth mode — this mode trades capacity for invisibility.
