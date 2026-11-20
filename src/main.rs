@@ -579,32 +579,25 @@ fn encode_stealth(
         block.is_multiple_of(2),
         "--stealth-block must be an even number of pixels"
     );
-    if options.chroma == Some(true) {
-        bail!(
-            "--chroma cannot be combined with --stealth; the chroma planes carry the background colours"
-        );
-    }
-    if options.chroma.is_none() && ctx.config.chroma == Some(true) && !ctx.quiet {
-        // A passive default from the config file must not block stealth
-        // encodes: warn and encode with the requested settings instead.
+    // The chroma planes carry the background colours in stealth encoding, so
+    // any chroma request (explicit flag or config default) is ignored with a
+    // warning; a config default must never block a stealth encode. An
+    // optimise target is applied instead of refused: the calibrated backend
+    // and all-intra choice transfer, only its chroma part never does.
+    let chroma_requested = options.chroma.is_some_and(|chroma| chroma)
+        || (options.chroma.is_none() && ctx.config.chroma == Some(true));
+    if chroma_requested && !ctx.quiet {
         eprintln!(
-            "Warning: ignoring the chroma setting from the config file; the chroma planes carry the background colours in stealth encoding."
+            "Warning: ignoring the chroma setting; the chroma planes carry the background colours in stealth encoding."
         );
     }
-    if let Some(target) = options.optimise {
-        ensure!(
-            target == Target::Off,
-            "--optimise cannot be combined with --stealth; calibration profiles only cover the cell format"
-        );
-    } else if options.optimise_target(ctx.config) != Target::Off {
-        // A passive default from the config file must not block stealth
-        // encodes: warn and encode with the requested settings instead.
-        if !ctx.quiet {
-            eprintln!(
-                "Warning: ignoring the optimise target from the config file; calibration profiles only cover the cell format and cannot apply to stealth encoding."
-            );
-        }
-    }
+    let mut tools = tools.clone();
+    let intra = optimise_for_stealth(
+        &mut tools,
+        &options,
+        ctx,
+        options.intra.or(ctx.config.intra).unwrap_or(false),
+    );
     let (bg_width, bg_height) = tools
         .dimensions(background)
         .context("could not probe the stealth background video")?;
@@ -624,7 +617,6 @@ fn encode_stealth(
         .clone()
         .or_else(|| ctx.config.preset.clone())
         .unwrap_or_else(|| "faster".to_owned());
-    let intra = options.intra.or(ctx.config.intra).unwrap_or(false);
     let parity = usize::from(options.ecc_symbols.or(ctx.config.ecc_symbols).unwrap_or(96));
     let iterations = options
         .pbkdf2_iterations
@@ -668,7 +660,7 @@ fn encode_stealth(
     let crypto_header = header.bytes();
     let mut stream = crypto_header.as_slice().chain(&mut staged);
     let tmp = stealth::encode(
-        tools,
+        &tools,
         background,
         &stealth::StealthSettings {
             width,
@@ -775,6 +767,80 @@ fn apply_optimisation(
         intra: chosen.intra,
         ..settings.clone()
     }
+}
+
+/// Applies the optimisation target to a stealth encode instead of refusing
+/// it: the calibrated backend and all-intra choice transfer to the stealth
+/// layer. Only the chroma frame mode never applies there, because the
+/// chroma planes carry the background colours. The profiles are measured on
+/// the cell format, so the choice is a hardware-level hint rather than an
+/// exact stealth measurement; the warning says as much. Returns the
+/// all-intra choice for the stealth encode.
+fn optimise_for_stealth(
+    tools: &mut video::Tools,
+    options: &Encoding,
+    ctx: &Ctx,
+    fallback_intra: bool,
+) -> bool {
+    let target = options.optimise_target(ctx.config);
+    if target == Target::Off {
+        return fallback_intra;
+    }
+    if !ctx.quiet {
+        eprintln!(
+            "Warning: the optimise profiles are calibrated on the cell format; for stealth encoding only the measured backend and all-intra choice apply (the chroma mode never does)."
+        );
+        eprintln!("Optimising video encoding for {}...", target.label());
+    }
+    let fingerprint = diag::fingerprint(&tools.ffmpeg);
+    let calibration = match Calibration::load(ctx.calibration) {
+        Ok(Some(saved)) if saved.is_fresh(&fingerprint) => saved,
+        _ => match quick_calibration(tools, options, ctx) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                eprintln!(
+                    "Warning: calibration failed ({error:#}); using the configured settings."
+                );
+                return fallback_intra;
+            }
+        },
+    };
+    let chosen = match calibration.choose(
+        target,
+        forced_backend(tools.gpu),
+        options.intra,
+        // Candidates that store data in the chroma planes cannot apply.
+        Some(false),
+    ) {
+        Some(chosen) => chosen,
+        None => {
+            if !ctx.quiet {
+                eprintln!(
+                    "No measured candidate matches the configured settings; keeping {} {}.",
+                    tools.gpu.short_name(),
+                    mode_name(fallback_intra, false)
+                );
+            }
+            return fallback_intra;
+        }
+    };
+    if !ctx.quiet {
+        eprintln!(
+            "Using {}{} for this machine ({:.2}s per {:.0} MiB, {:.0}% file size in the benchmark).",
+            chosen.backend,
+            match mode_name(chosen.intra, chosen.chroma) {
+                "base" => String::new(),
+                label => format!(" {label}"),
+            },
+            chosen.encode_s + chosen.decode_s,
+            chosen.payload as f64 / (1024.0 * 1024.0),
+            (chosen.mp4 as f64 / chosen.payload.max(1) as f64) * 100.0
+        );
+    }
+    if let Some(backend) = video::Gpu::from_name(&chosen.backend) {
+        tools.gpu = backend;
+    }
+    chosen.intra
 }
 
 fn restorable_name(name: &str) -> Result<&str> {

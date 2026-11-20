@@ -390,16 +390,21 @@ fn stealth_round_trip_with_looping_background_audio() {
     success(encoded.clone());
     let stderr = String::from_utf8_lossy(&encoded.stderr);
     assert!(
-        stderr.contains("ignoring the optimise target"),
-        "expected an optimise warning, got: {stderr}"
+        stderr.contains("Optimising video encoding for smallest"),
+        "expected the config's optimise target to apply, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("calibrated on the cell format"),
+        "expected an optimise caveat, got: {stderr}"
     );
     assert!(
         stderr.contains("ignoring the chroma setting"),
         "expected a chroma warning, got: {stderr}"
     );
 
-    // The explicit flag remains rejected.
-    let rejected = cli(
+    // An explicit --optimise also applies to stealth, with the same caveat
+    // about the cell-format calibration.
+    let explicit = cli(
         dir,
         &[
             "encode",
@@ -409,21 +414,20 @@ fn stealth_round_trip_with_looping_background_audio() {
             "dummy.mp4",
             "--optimise",
             "smallest",
-            "--password",
-            "a",
-            "--pbkdf2-iterations",
-            "1000",
+            "--no-password",
         ],
     );
-    assert!(!rejected.status.success());
-    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    success(explicit.clone());
+    let stderr = String::from_utf8_lossy(&explicit.stderr);
     assert!(
-        stderr.contains("cannot be combined with --stealth"),
-        "expected an explicit --optimise rejection, got: {stderr}"
+        stderr.contains("calibrated on the cell format"),
+        "expected an explicit --optimise caveat, got: {stderr}"
     );
+    success(cli(dir, &["decode", "stealth-2.mp4", "restored-opt.bin"]));
+    assert_eq!(fs::read(dir.join("restored-opt.bin")).unwrap(), data);
 
-    // The explicit --chroma flag remains rejected as well.
-    let rejected_chroma = cli(
+    // An explicit --chroma flag is ignored with a warning as well.
+    let explicit_chroma = cli(
         dir,
         &[
             "encode",
@@ -432,18 +436,26 @@ fn stealth_round_trip_with_looping_background_audio() {
             "--stealth",
             "dummy.mp4",
             "--chroma",
-            "--password",
-            "a",
-            "--pbkdf2-iterations",
-            "1000",
+            "--no-password",
+            "--optimise",
+            "off",
         ],
     );
-    assert!(!rejected_chroma.status.success());
-    let stderr = String::from_utf8_lossy(&rejected_chroma.stderr);
+    success(explicit_chroma.clone());
+    let stderr = String::from_utf8_lossy(&explicit_chroma.stderr);
     assert!(
-        stderr.contains("cannot be combined with --stealth"),
-        "expected an explicit --chroma rejection, got: {stderr}"
+        stderr.contains("ignoring the chroma setting"),
+        "expected an explicit --chroma warning, got: {stderr}"
     );
+    assert!(
+        !stderr.contains("Optimising"),
+        "chroma alone must not trigger optimisation, got: {stderr}"
+    );
+    success(cli(
+        dir,
+        &["decode", "stealth-3.mp4", "restored-chroma.bin"],
+    ));
+    assert_eq!(fs::read(dir.join("restored-chroma.bin")).unwrap(), data);
 
     let probe = Command::new("ffprobe")
         .current_dir(dir)
