@@ -468,4 +468,91 @@ fn stealth_round_trip_with_looping_background_audio() {
         &["decode", "stealth.mp4", "restored.bin", "--password", "a"],
     ));
     assert_eq!(fs::read(dir.join("restored.bin")).unwrap(), data);
+
+    // A denser block encodes far fewer frames for the same payload, and the
+    // blind decoder detects the block size automatically: no flag on decode.
+    let dense = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-block4.mp4",
+            "--stealth",
+            "dummy.mp4",
+            "--stealth-block",
+            "4",
+            "--fps",
+            "10",
+            "--preset",
+            "ultrafast",
+            "--password",
+            "a",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    );
+    success(dense.clone());
+    let dense_stderr = String::from_utf8_lossy(&dense.stderr);
+    assert!(
+        dense_stderr.contains("block 4"),
+        "expected the block size in the message, got: {dense_stderr}"
+    );
+    let frames = |file: &str| {
+        let probe = Command::new("ffprobe")
+            .current_dir(dir)
+            .args(["-v", "error", "-count_frames", "-select_streams", "v:0"])
+            .args([
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
+                file,
+            ])
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    assert!(
+        frames("stealth-block4.mp4") * 2 < frames("stealth.mp4"),
+        "block 4 must use well under half the frames of the default block 6"
+    );
+    success(cli(
+        dir,
+        &[
+            "decode",
+            "stealth-block4.mp4",
+            "restored-block4.bin",
+            "--password",
+            "a",
+        ],
+    ));
+    assert_eq!(fs::read(dir.join("restored-block4.bin")).unwrap(), data);
+
+    // An odd block size is rejected up front.
+    let odd = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-odd.mp4",
+            "--stealth",
+            "dummy.mp4",
+            "--stealth-block",
+            "3",
+            "--password",
+            "a",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    );
+    assert!(!odd.status.success());
+    let stderr = String::from_utf8_lossy(&odd.stderr);
+    assert!(
+        stderr.contains("--stealth-block must be an even"),
+        "expected an even-block rejection, got: {stderr}"
+    );
 }
