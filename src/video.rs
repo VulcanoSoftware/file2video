@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
-// The default CRF loses dozens of single-pixel luma levels per frame; crf 10
-// keeps the residual cell noise far below the Reed-Solomon correction budget
-// while still letting the encoder do most of the compression work.
-const COMPACT_MAX_CRF: u8 = 10;
+// A higher CRF erases whole single-pixel luma levels per frame; crf 8 keeps
+// the residual cell noise far below the Reed-Solomon correction budget of
+// every supported parity count while still letting the encoder do most of
+// the compression work.
+const COMPACT_MAX_CRF: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Gpu {
@@ -567,7 +568,7 @@ pub struct Settings {
     pub fps: u8,
     pub crf: u8,
     pub preset: String,
-    /// Luma levels per cell: 1 (Bit2Vid v1, black/white) or 4 (16 levels).
+    /// Luma levels per cell: 4 (16 levels).
     pub cell_bits: u8,
     /// Store the video at cell resolution instead of full resolution.
     pub compact: bool,
@@ -654,21 +655,6 @@ fn speed(bytes: u64, seconds: f64) -> String {
     format!("{rate:.1} MB/s")
 }
 
-const fn expansion() -> [[u8; 8]; 256] {
-    let mut lut = [[0; 8]; 256];
-    let mut value = 0;
-    while value < 256 {
-        let mut bit = 0;
-        while bit < 8 {
-            lut[value][bit] = if value & (128 >> bit) != 0 { 255 } else { 0 };
-            bit += 1;
-        }
-        value += 1;
-    }
-    lut
-}
-static EXPAND: [[u8; 8]; 256] = expansion();
-
 const fn luma_levels() -> [u8; 16] {
     let mut levels = [0; 16];
     let mut level = 0;
@@ -686,54 +672,23 @@ pub struct Sink<W> {
     pos: usize,
     sent: u64,
     bytes: u64,
-    cell_bits: u8,
     progress: Progress,
 }
 
 impl<W: Write> Sink<W> {
-    pub fn new(pipe: W, grid: Grid, cell_bits: u8, frames: u64) -> Self {
+    pub fn new(pipe: W, grid: Grid, frames: u64) -> Self {
         Self {
             pipe,
             grid: vec![0; grid.bits()],
             pos: 0,
             sent: 0,
             bytes: 0,
-            cell_bits,
             progress: Progress::new("Encode", frames),
         }
     }
 
-    pub fn push(&mut self, mut bytes: &[u8]) -> Result<()> {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<()> {
         self.bytes += bytes.len() as u64;
-        if self.cell_bits == 1 {
-            while !bytes.is_empty() {
-                let n = bytes.len().min((self.grid.len() - self.pos) / 8);
-                let end = self.pos + n * 8;
-                for (dst, &byte) in self.grid[self.pos..end]
-                    .as_chunks_mut::<8>()
-                    .0
-                    .iter_mut()
-                    .zip(bytes)
-                {
-                    *dst = EXPAND[byte as usize];
-                }
-                self.pos = end;
-                bytes = &bytes[n..];
-                if self.pos == self.grid.len() {
-                    self.flush_frame()?;
-                } else if !bytes.is_empty() {
-                    // A byte may straddle frames with a non-byte-aligned grid.
-                    let tail = self.grid.len() - self.pos;
-                    let bits = &EXPAND[bytes[0] as usize];
-                    self.grid[self.pos..].copy_from_slice(&bits[..tail]);
-                    self.flush_frame()?;
-                    self.grid[..8 - tail].copy_from_slice(&bits[tail..]);
-                    self.pos = 8 - tail;
-                    bytes = &bytes[1..];
-                }
-            }
-            return Ok(());
-        }
         for &byte in bytes {
             self.place(byte >> 4)?;
             self.place(byte & 0x0f)?;
@@ -772,46 +727,15 @@ impl<W: Write> Sink<W> {
 type Sampler = fn(&[u8], Grid, &mut [u8]);
 type Packer = fn(&[u8]) -> u8;
 
-fn sampler(block: usize, cell_bits: u8) -> Sampler {
-    match cell_bits {
-        1 => match block {
-            1 => sample::<1>,
-            8 => sample::<8>,
-            10 => sample::<10>,
-            12 => sample::<12>,
-            16 => sample::<16>,
-            20 => sample::<20>,
-            _ => unreachable!(),
-        },
-        _ => match block {
-            1 => sample4::<1>,
-            8 => sample4::<8>,
-            10 => sample4::<10>,
-            12 => sample4::<12>,
-            16 => sample4::<16>,
-            20 => sample4::<20>,
-            _ => unreachable!(),
-        },
-    }
-}
-
-fn sample<const B: usize>(frame: &[u8], grid: Grid, bits: &mut [u8]) {
-    let quarter = B / 4;
-    let center = B - 2 * quarter;
-    let cells = grid.width / B;
-    for (y, row) in bits.chunks_exact_mut(cells).enumerate() {
-        let start = (y * B + quarter) * grid.width + quarter;
-        for (x, bit) in row.iter_mut().enumerate() {
-            let mut sum = 0u32;
-            let origin = start + x * B;
-            for dy in 0..center {
-                let offset = origin + dy * grid.width;
-                for &value in &frame[offset..offset + center] {
-                    sum += u32::from(value);
-                }
-            }
-            *bit = u8::from(sum >= (128 * center * center) as u32);
-        }
+fn sampler(block: usize) -> Sampler {
+    match block {
+        1 => sample4::<1>,
+        8 => sample4::<8>,
+        10 => sample4::<10>,
+        12 => sample4::<12>,
+        16 => sample4::<16>,
+        20 => sample4::<20>,
+        _ => unreachable!(),
     }
 }
 
@@ -835,19 +759,8 @@ fn sample4<const B: usize>(frame: &[u8], grid: Grid, cells: &mut [u8]) {
     }
 }
 
-fn pack_bits(cells: &[u8]) -> u8 {
-    cells.iter().fold(0, |byte, &bit| (byte << 1) | bit)
-}
-
 fn pack_nibbles(cells: &[u8]) -> u8 {
     (cells[0] << 4) | cells[1]
-}
-
-fn packer(cell_bits: u8) -> Packer {
-    match cell_bits {
-        1 => pack_bits,
-        _ => pack_nibbles,
-    }
 }
 
 pub struct Source<R> {
@@ -880,85 +793,82 @@ impl<R: Read> Source<R> {
             .as_ref()
             .map(std::slice::from_ref)
             .unwrap_or(&BLOCK_SIZES);
-        for cell_bits in [4u8, 1] {
-            let units = usize::from(8 / cell_bits);
-            for &block in blocks {
-                let Ok(grid) = (Grid {
-                    width,
-                    height,
-                    block,
-                })
-                .validate() else {
-                    continue;
-                };
-                let sample = sampler(block, cell_bits);
-                let mut cells = vec![0u8; grid.bits()];
-                sample(&image, grid, &mut cells);
-                for (byte, unit) in head.iter_mut().zip(cells.chunks_exact(units)) {
-                    *byte = packer(cell_bits)(unit);
-                }
-                if let Ok(header) = parse_transport(&head)
-                    && !header.compact
-                    && header.width == width
-                    && header.height == height
-                    && header.block == block
-                    && header.cell_bits == cell_bits
-                {
-                    return Ok((
-                        Self {
-                            pipe,
-                            image,
-                            units: cells,
-                            pos: TRANSPORT_SIZE * units,
-                            grid,
-                            sampler: sample,
-                            packer: packer(cell_bits),
-                            cell_bits,
-                            compact: false,
-                            read: 1,
-                            bytes: 0,
-                            progress: Progress::new("Decode", 1),
-                        },
-                        header.parity,
-                        header.protected,
-                    ));
-                }
+        for &block in blocks {
+            let Ok(grid) = (Grid {
+                width,
+                height,
+                block,
+            })
+            .validate() else {
+                continue;
+            };
+            let sample = sampler(block);
+            let mut cells = vec![0u8; grid.bits()];
+            sample(&image, grid, &mut cells);
+            for (byte, unit) in head.iter_mut().zip(cells.as_chunks::<2>().0) {
+                *byte = pack_nibbles(unit);
             }
-            if width * height >= TRANSPORT_SIZE * units {
-                let sample = sampler(1, cell_bits);
-                let grid = Grid {
-                    width,
-                    height,
-                    block: 1,
-                };
-                let mut cells = vec![0u8; grid.bits()];
-                sample(&image, grid, &mut cells);
-                for (byte, unit) in head.iter_mut().zip(cells.chunks_exact(units)) {
-                    *byte = packer(cell_bits)(unit);
-                }
-                if let Ok(header) = parse_transport(&head)
-                    && header.compact
-                    && header.cell_bits == cell_bits
-                {
-                    return Ok((
-                        Self {
-                            pipe,
-                            image,
-                            units: cells,
-                            pos: TRANSPORT_SIZE * units,
-                            grid,
-                            sampler: sample,
-                            packer: packer(cell_bits),
-                            cell_bits,
-                            compact: true,
-                            read: 1,
-                            bytes: 0,
-                            progress: Progress::new("Decode", 1),
-                        },
-                        header.parity,
-                        header.protected,
-                    ));
-                }
+            if let Ok(header) = parse_transport(&head)
+                && !header.compact
+                && header.width == width
+                && header.height == height
+                && header.block == block
+                && header.cell_bits == 4
+            {
+                return Ok((
+                    Self {
+                        pipe,
+                        image,
+                        units: cells,
+                        pos: TRANSPORT_SIZE * 2,
+                        grid,
+                        sampler: sample,
+                        packer: pack_nibbles,
+                        cell_bits: 4,
+                        compact: false,
+                        read: 1,
+                        bytes: 0,
+                        progress: Progress::new("Decode", 1),
+                    },
+                    header.parity,
+                    header.protected,
+                ));
+            }
+        }
+        if width * height >= TRANSPORT_SIZE * 2 {
+            let grid = Grid {
+                width,
+                height,
+                block: 1,
+            };
+            let sample = sampler(1);
+            let mut cells = vec![0u8; grid.bits()];
+            sample(&image, grid, &mut cells);
+            for (byte, unit) in head.iter_mut().zip(cells.as_chunks::<2>().0) {
+                *byte = pack_nibbles(unit);
+            }
+            if let Ok(header) = parse_transport(&head)
+                && header.compact
+                && header.cell_bits == 4
+            {
+                return Ok((
+                    Self {
+                        pipe,
+                        image,
+                        units: cells,
+                        pos: TRANSPORT_SIZE * 2,
+                        grid,
+                        sampler: sample,
+                        packer: pack_nibbles,
+                        cell_bits: 4,
+                        compact: true,
+                        read: 1,
+                        bytes: 0,
+                        progress: Progress::new("Decode", 1),
+                    },
+                    header.parity,
+                    header.protected,
+                ));
             }
         }
         anyhow::bail!("not a file2video video; wrong layout or damaged first frame")
@@ -1044,16 +954,16 @@ pub fn default_ffmpeg() -> &'static OsStr {
 #[cfg(test)]
 mod tests {
     use super::{
-        Gpu, Sink, Source, amf_quality, frame_sync_for, human_duration, nvenc_preset, pack_bits,
-        pack_nibbles, sampler, speed, trial_failure, vt_quality,
+        Gpu, Sink, Source, amf_quality, frame_sync_for, human_duration, nvenc_preset, pack_nibbles,
+        sampler, speed, trial_failure, vt_quality,
     };
     use crate::format::{self, Grid};
     use std::io::{Cursor, Read};
 
     #[test]
-    fn packs_bits_and_nibbles() {
-        assert_eq!(pack_bits(&[0, 1, 0, 0, 0, 0, 1, 1]), 0x43);
+    fn packs_nibbles() {
         assert_eq!(pack_nibbles(&[12, 5]), 0xc5);
+        assert_eq!(pack_nibbles(&[0, 15]), 0x0f);
     }
 
     fn emulate_ffmpeg_scale(raw: &[u8], grid: Grid) -> Vec<u8> {
@@ -1075,46 +985,44 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_both_cell_widths_through_frames() {
-        for cell_bits in [4u8, 1] {
-            let grid = Grid {
-                width: 648,
-                height: 360,
-                block: 8,
-            }
-            .validate()
-            .unwrap();
-            let mut seed = 0x1234_abcdu32;
-            let data: Vec<u8> = (0..4096)
-                .map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 17;
-                    seed ^= seed << 5;
-                    seed as u8
-                })
-                .collect();
-            let mut raw = Vec::new();
-            {
-                let mut sink = Sink::new(&mut raw, grid, cell_bits, 1);
-                sink.push(&format::transport(grid, 64, 285, cell_bits, false))
-                    .unwrap();
-                sink.push(&[7u8; format::ECC_SIZE]).unwrap();
-                sink.push(&data).unwrap();
-                sink.finish().unwrap();
-            }
-            let expanded = emulate_ffmpeg_scale(&raw, grid);
-            let (mut source, parity, protected) =
-                Source::open(Cursor::new(&expanded), 648, 360, None).unwrap();
-            assert_eq!(parity, 64);
-            assert_eq!(protected, 285);
-            assert_eq!(source.cell_bits(), cell_bits);
-            let mut ecc = [0; 30];
-            source.read_exact(&mut ecc).unwrap();
-            let mut out = vec![0; data.len()];
-            source.read_exact(&mut out).unwrap();
-            assert_eq!(out, data);
-            source.finish().unwrap();
+    fn round_trips_16_level_full_resolution_frames() {
+        let grid = Grid {
+            width: 648,
+            height: 360,
+            block: 8,
         }
+        .validate()
+        .unwrap();
+        let mut seed = 0x1234_abcdu32;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let mut raw = Vec::new();
+        {
+            let mut sink = Sink::new(&mut raw, grid, 1);
+            sink.push(&format::transport(grid, 64, 285, 4, false))
+                .unwrap();
+            sink.push(&[7u8; format::ECC_SIZE]).unwrap();
+            sink.push(&data).unwrap();
+            sink.finish().unwrap();
+        }
+        let expanded = emulate_ffmpeg_scale(&raw, grid);
+        let (mut source, parity, protected) =
+            Source::open(Cursor::new(&expanded), 648, 360, None).unwrap();
+        assert_eq!(parity, 64);
+        assert_eq!(protected, 285);
+        assert_eq!(source.cell_bits(), 4);
+        let mut ecc = [0; 30];
+        source.read_exact(&mut ecc).unwrap();
+        let mut out = vec![0; data.len()];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, data);
+        source.finish().unwrap();
     }
 
     #[test]
@@ -1140,7 +1048,7 @@ mod tests {
             .collect();
         let mut raw = Vec::new();
         {
-            let mut sink = Sink::new(&mut raw, grid, 4, 1);
+            let mut sink = Sink::new(&mut raw, grid, 1);
             sink.push(&format::transport(display, 64, 285, 4, true))
                 .unwrap();
             sink.push(&[7u8; format::ECC_SIZE]).unwrap();
@@ -1171,7 +1079,7 @@ mod tests {
         .unwrap();
         let frame = vec![17u8; grid.width * grid.height];
         let mut cells = vec![0u8; grid.bits()];
-        sampler(8, 4)(&frame, grid, &mut cells);
+        sampler(8)(&frame, grid, &mut cells);
         assert_eq!(cells[0], 1);
         assert!(cells[..grid.bits()].iter().all(|&cell| cell == 1));
     }

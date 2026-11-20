@@ -123,14 +123,6 @@ jobs:
           echo "Built Mach-O architecture: $architectures"
           test "$architectures" = x86_64
 
-      - name: Test interoperability with the reference implementation
-        if: matrix.platform == 'linux-x86_64'
-        run: |
-          git clone https://github.com/nuan-cmyk/Bit2Vid.git "$RUNNER_TEMP/bit2vid"
-          git -C "$RUNNER_TEMP/bit2vid" checkout --detach b782ae9226ae457a321a3147ae8e77b2b1a42154
-          python -m pip install numpy==2.2.6 pycryptodome==3.23.0 reedsolo==1.7.0 tqdm==4.67.1
-          python tests/interoperability.py target/release/file2video "$RUNNER_TEMP/bit2vid/src"
-
       - name: Test release automation
         if: matrix.platform == 'linux-x86_64'
         run: python -m unittest discover -s tests -p test_release.py
