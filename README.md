@@ -84,12 +84,12 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 
 ### `benchmark [INPUT]`
 
-Measures every relevant configuration on this machine: each available backend × each mode (default, `--intra`, `--chroma`, both), then prints a table with frames, encode/decode wall time and speed in MB/s, MP4 size and data/MP4 efficiency. Without `--input` it generates pseudo-random payload of `--size` MiB (default 8). Not affected by `--compress`; the password/PBKDF2 speed is not representative because a fixed low iteration count is used.
+Measures every relevant configuration on this machine: each available backend × each mode (default, `--intra`, `--chroma`, both), then prints a table with frames, encode/decode wall time and speed in MB/s, MP4 size and data/MP4 efficiency. Without a positional INPUT file it generates pseudo-random payload of `--size` MiB (default 8). Not affected by `--compress`; the password/PBKDF2 speed is not representative because a fixed low iteration count is used.
 
 ```sh
 ./file2video benchmark                          # all backends x all modes on an 8 MiB payload
 ./file2video benchmark --gpu amf --size 64      # only AMF (plus CPU for comparison), 64 MiB
-./file2video benchmark --input archive.zip      # real file, e.g. to check its MP4 size
+./file2video benchmark archive.zip              # real file, e.g. to check its MP4 size
 ```
 
 Backends whose trial encode fails (for example when a GPU driver is missing) are listed with their FFmpeg error. Run it before choosing `--chroma`/`--intra` to see what is fastest on your machine.
