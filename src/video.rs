@@ -12,6 +12,10 @@ use std::time::Instant;
 // every supported parity count while still letting the encoder do most of
 // the compression work.
 const COMPACT_MAX_CRF: u8 = 8;
+// All-intra frames get no relief from temporal prediction, and crf 8 damages
+// 10x more cells than crf 6 while the video only shrinks by 8%, so the intra
+// mode holds one CRF step in reserve.
+const INTRA_MAX_CRF: u8 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Gpu {
@@ -34,7 +38,7 @@ pub enum Gpu {
 impl Gpu {
     const VAAPI_DEVICE: &'static str = "/dev/dri/renderD128";
 
-    fn encoder_name(self) -> &'static str {
+    pub fn encoder_name(self) -> &'static str {
         match self {
             Self::Amf => "h264_amf",
             Self::Nvenc => "h264_nvenc",
@@ -228,7 +232,11 @@ impl Tools {
         // whose Reed-Solomon overhead stays comfortably below the correction
         // capacity of the frame, regardless of what the caller passed.
         let crf = if settings.compact {
-            settings.crf.min(COMPACT_MAX_CRF)
+            settings.crf.min(if settings.intra {
+                INTRA_MAX_CRF
+            } else {
+                COMPACT_MAX_CRF
+            })
         } else {
             settings.crf
         };
@@ -239,25 +247,24 @@ impl Tools {
                 cmd.arg(arg);
             }
         }
-        cmd.args([
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "gray",
-            "-video_size",
-        ])
-        .arg(&small)
-        .args([
-            "-framerate",
-            &settings.fps.to_string(),
-            "-i",
-            "pipe:0",
-            "-an",
-            "-filter_threads",
-            "1",
-            "-vf",
-        ]);
+        cmd.arg("-y")
+            .args(["-f", "rawvideo", "-pixel_format"])
+            .arg(if settings.chroma { "yuv420p" } else { "gray" })
+            .arg("-video_size")
+            .arg(&small)
+            .args([
+                "-framerate",
+                &settings.fps.to_string(),
+                "-i",
+                "pipe:0",
+                "-an",
+                "-filter_threads",
+                "1",
+            ]);
+        if settings.intra {
+            cmd.args(["-g", "1"]);
+        }
+        cmd.arg("-vf");
         let quality: Vec<String>;
         match encoder {
             Encoder::Cpu => {
@@ -282,6 +289,21 @@ impl Tools {
             .stdin(Stdio::piped())
             .stdout(Stdio::null());
         self.spawn(cmd)
+    }
+
+    // Hardware encoder candidates this FFmpeg build could run, discrete GPUs first.
+    pub fn available_backends(&self) -> Vec<Gpu> {
+        let Ok(list) = self.encoder_list() else {
+            return Vec::new();
+        };
+        let gpus = crate::diag::gpu_names();
+        Gpu::prioritized_candidates(&gpus)
+            .into_iter()
+            .filter(|backend| {
+                list.split_whitespace()
+                    .any(|word| word == backend.encoder_name())
+            })
+            .collect()
     }
 
     fn encoder_list(&self) -> Result<String> {
@@ -438,7 +460,7 @@ impl Tools {
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "gray",
+            "yuv420p",
             "pipe:1",
         ])
         .stdin(Stdio::null())
@@ -572,6 +594,10 @@ pub struct Settings {
     pub cell_bits: u8,
     /// Store the video at cell resolution instead of full resolution.
     pub compact: bool,
+    /// Store payload cells in the U and V chroma planes as well (+50% capacity).
+    pub chroma: bool,
+    /// Encode every frame as an all-intra keyframe.
+    pub intra: bool,
 }
 
 pub struct Process {
@@ -650,7 +676,7 @@ fn human_duration(seconds: u64) -> String {
     }
 }
 
-fn speed(bytes: u64, seconds: f64) -> String {
+pub fn speed(bytes: u64, seconds: f64) -> String {
     let rate = bytes as f64 / seconds / (1024.0 * 1024.0);
     format!("{rate:.1} MB/s")
 }
@@ -676,10 +702,13 @@ pub struct Sink<W> {
 }
 
 impl<W: Write> Sink<W> {
-    pub fn new(pipe: W, grid: Grid, frames: u64) -> Self {
+    // The frame buffer is a full Y plane followed, in chroma mode, by the U
+    // and V planes; the payload nibbles flow through Y, U and V in that order.
+    pub fn new(pipe: W, grid: Grid, chroma: bool, frames: u64) -> Self {
+        let cells = grid.bits() + if chroma { grid.bits() / 2 } else { 0 };
         Self {
             pipe,
-            grid: vec![0; grid.bits()],
+            grid: vec![0; cells],
             pos: 0,
             sent: 0,
             bytes: 0,
@@ -763,6 +792,15 @@ fn pack_nibbles(cells: &[u8]) -> u8 {
     (cells[0] << 4) | cells[1]
 }
 
+// Maps limited studio range (16..235) back to full range; matches the
+// grayscale conversion FFmpeg applies down to the exact rounding.
+fn unmap_studio_range(plane: &mut [u8]) {
+    for value in plane.iter_mut() {
+        let expanded = (u32::from(*value).saturating_sub(16) * 255 + 109) / 219;
+        *value = expanded.min(255) as u8;
+    }
+}
+
 pub struct Source<R> {
     pipe: R,
     image: Vec<u8>,
@@ -773,6 +811,8 @@ pub struct Source<R> {
     packer: Packer,
     cell_bits: u8,
     compact: bool,
+    chroma: bool,
+    luma_cells: usize,
     read: u64,
     bytes: u64,
     progress: Progress,
@@ -785,9 +825,19 @@ impl<R: Read> Source<R> {
         height: usize,
         block: Option<usize>,
     ) -> Result<(Self, usize, u64)> {
-        let mut image = vec![0; width * height];
+        // Always receive yuv420p frames; the Y plane carries the payload in
+        // every mode, and the U and V planes carry more payload in chroma
+        // mode. The Y-first plane order matches the pack order below.
+        let luma_pixels = width * height;
+        let quarter_plane = luma_pixels / 4;
+        let mut image = vec![0; luma_pixels + 2 * quarter_plane];
         pipe.read_exact(&mut image)
             .context("no complete first frame from FFmpeg")?;
+        // Non-chroma videos store a full-range gray frame, which FFmpeg maps
+        // to the limited studio range when encoding. Recover it here so data
+        // written by every released build keeps decoding correctly.
+        let mut luma = image[..luma_pixels].to_vec();
+        unmap_studio_range(&mut luma);
         let mut head = [0; TRANSPORT_SIZE];
         let blocks = block
             .as_ref()
@@ -804,7 +854,7 @@ impl<R: Read> Source<R> {
             };
             let sample = sampler(block);
             let mut cells = vec![0u8; grid.bits()];
-            sample(&image, grid, &mut cells);
+            sample(&luma, grid, &mut cells);
             for (byte, unit) in head.iter_mut().zip(cells.as_chunks::<2>().0) {
                 *byte = pack_nibbles(unit);
             }
@@ -826,6 +876,8 @@ impl<R: Read> Source<R> {
                         packer: pack_nibbles,
                         cell_bits: 4,
                         compact: false,
+                        chroma: false,
+                        luma_cells: grid.bits(),
                         read: 1,
                         bytes: 0,
                         progress: Progress::new("Decode", 1),
@@ -842,33 +894,57 @@ impl<R: Read> Source<R> {
                 block: 1,
             };
             let sample = sampler(1);
-            let mut cells = vec![0u8; grid.bits()];
-            sample(&image, grid, &mut cells);
-            for (byte, unit) in head.iter_mut().zip(cells.as_chunks::<2>().0) {
-                *byte = pack_nibbles(unit);
-            }
-            if let Ok(header) = parse_transport(&head)
-                && header.compact
-                && header.cell_bits == 4
-            {
-                return Ok((
-                    Self {
-                        pipe,
-                        image,
-                        units: cells,
-                        pos: TRANSPORT_SIZE * 2,
-                        grid,
-                        sampler: sample,
-                        packer: pack_nibbles,
-                        cell_bits: 4,
-                        compact: true,
-                        read: 1,
-                        bytes: 0,
-                        progress: Progress::new("Decode", 1),
-                    },
-                    header.parity,
-                    header.protected,
-                ));
+            let chroma_grid = Grid {
+                width: width / 2,
+                height: height / 2,
+                block: 1,
+            };
+            for chroma in [false, true] {
+                let mut cells = vec![0u8; grid.bits() + if chroma { quarter_plane * 2 } else { 0 }];
+                if chroma {
+                    sample(&image[..luma_pixels], grid, &mut cells[..grid.bits()]);
+                    sample4::<1>(
+                        &image[luma_pixels..luma_pixels + quarter_plane],
+                        chroma_grid,
+                        &mut cells[grid.bits()..grid.bits() + quarter_plane],
+                    );
+                    sample4::<1>(
+                        &image[luma_pixels + quarter_plane..],
+                        chroma_grid,
+                        &mut cells[grid.bits() + quarter_plane..],
+                    );
+                } else {
+                    sample(&luma, grid, &mut cells);
+                }
+                for (byte, unit) in head.iter_mut().zip(cells.as_chunks::<2>().0) {
+                    *byte = pack_nibbles(unit);
+                }
+                if let Ok(header) = parse_transport(&head)
+                    && header.compact
+                    && header.cell_bits == 4
+                    && header.chroma == chroma
+                {
+                    return Ok((
+                        Self {
+                            pipe,
+                            image,
+                            units: cells,
+                            pos: TRANSPORT_SIZE * 2,
+                            grid,
+                            sampler: sample,
+                            packer: pack_nibbles,
+                            cell_bits: 4,
+                            compact: true,
+                            chroma,
+                            luma_cells: grid.bits(),
+                            read: 1,
+                            bytes: 0,
+                            progress: Progress::new("Decode", 1),
+                        },
+                        header.parity,
+                        header.protected,
+                    ));
+                }
             }
         }
         anyhow::bail!("not a file2video video; wrong layout or damaged first frame")
@@ -886,13 +962,41 @@ impl<R: Read> Source<R> {
         self.cell_bits
     }
 
+    pub fn chroma(&self) -> bool {
+        self.chroma
+    }
+
     pub fn compact(&self) -> bool {
         self.compact
     }
 
     fn next_frame(&mut self) -> io::Result<()> {
         self.pipe.read_exact(&mut self.image)?;
-        (self.sampler)(&self.image, self.grid, &mut self.units);
+        if !self.chroma {
+            let luma_pixels = self.image.len() * 2 / 3;
+            unmap_studio_range(&mut self.image[..luma_pixels]);
+        }
+        (self.sampler)(&self.image, self.grid, &mut self.units[..self.luma_cells]);
+        if self.chroma {
+            let luma = self.luma_cells;
+            let quarter = luma / 4;
+            let image = &self.image;
+            let chroma_grid = Grid {
+                width: self.grid.width / 2,
+                height: self.grid.height / 2,
+                block: 1,
+            };
+            sample4::<1>(
+                &image[luma..luma + quarter],
+                chroma_grid,
+                &mut self.units[luma..luma + quarter],
+            );
+            sample4::<1>(
+                &image[luma + quarter..luma + 2 * quarter],
+                chroma_grid,
+                &mut self.units[luma + quarter..luma + 2 * quarter],
+            );
+        }
         self.read += 1;
         self.bytes += self.units.len() as u64;
         self.progress.update(self.read, self.bytes);
@@ -966,6 +1070,8 @@ mod tests {
         assert_eq!(pack_nibbles(&[0, 15]), 0x0f);
     }
 
+    // Emulates what FFmpeg does to a gray input frame: maps the full range
+    // to the limited studio range and scales it up with nearest neighbor.
     fn emulate_ffmpeg_scale(raw: &[u8], grid: Grid) -> Vec<u8> {
         let frame_cells = grid.bits();
         let frame_pixels = grid.width * grid.height;
@@ -977,11 +1083,15 @@ mod tests {
         {
             for (y, row) in frame.chunks_exact_mut(grid.width).enumerate() {
                 for (x, pixel) in row.iter_mut().enumerate() {
-                    *pixel = small[(y / grid.block) * columns + x / grid.block];
+                    *pixel = to_studio_range(small[(y / grid.block) * columns + x / grid.block]);
                 }
             }
         }
         out
+    }
+
+    fn to_studio_range(value: u8) -> u8 {
+        16 + ((u32::from(value) * 219 + 127) / 255) as u8
     }
 
     #[test]
@@ -1004,14 +1114,19 @@ mod tests {
             .collect();
         let mut raw = Vec::new();
         {
-            let mut sink = Sink::new(&mut raw, grid, 1);
-            sink.push(&format::transport(grid, 64, 285, 4, false))
+            let mut sink = Sink::new(&mut raw, grid, false, 1);
+            sink.push(&format::transport(grid, 64, 285, 4, false, false))
                 .unwrap();
             sink.push(&[7u8; format::ECC_SIZE]).unwrap();
             sink.push(&data).unwrap();
             sink.finish().unwrap();
         }
-        let expanded = emulate_ffmpeg_scale(&raw, grid);
+        let frame_pixels = grid.width * grid.height;
+        let mut expanded = Vec::new();
+        for frame in emulate_ffmpeg_scale(&raw, grid).chunks(frame_pixels) {
+            expanded.extend_from_slice(frame);
+            expanded.extend(std::iter::repeat_n(128u8, frame_pixels / 2));
+        }
         let (mut source, parity, protected) =
             Source::open(Cursor::new(&expanded), 648, 360, None).unwrap();
         assert_eq!(parity, 64);
@@ -1048,8 +1163,56 @@ mod tests {
             .collect();
         let mut raw = Vec::new();
         {
-            let mut sink = Sink::new(&mut raw, grid, 1);
-            sink.push(&format::transport(display, 64, 285, 4, true))
+            let mut sink = Sink::new(&mut raw, grid, false, 1);
+            sink.push(&format::transport(display, 64, 285, 4, true, false))
+                .unwrap();
+            sink.push(&[7u8; format::ECC_SIZE]).unwrap();
+            sink.push(&data).unwrap();
+            sink.finish().unwrap();
+        }
+        raw.extend(std::iter::repeat_n(128u8, 256 * 256 / 2));
+        for pixel in &mut raw[..256 * 256] {
+            *pixel = to_studio_range(*pixel);
+        }
+        let (mut source, parity, protected) =
+            Source::open(Cursor::new(&raw), 256, 256, None).unwrap();
+        assert_eq!(parity, 64);
+        assert_eq!(protected, 285);
+        assert_eq!(source.cell_bits(), 4);
+        assert!(!source.chroma());
+        let mut ecc = [0; format::ECC_SIZE];
+        source.read_exact(&mut ecc).unwrap();
+        let mut out = vec![0; data.len()];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, data);
+        source.finish().unwrap();
+    }
+
+    #[test]
+    fn round_trips_compact_chroma_cells() {
+        let grid = Grid {
+            width: 256,
+            height: 256,
+            block: 1,
+        };
+        let display = Grid {
+            width: 648,
+            height: 360,
+            block: 8,
+        };
+        let mut seed = 0x1f2e_3d4cu32;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let mut raw = Vec::new();
+        {
+            let mut sink = Sink::new(&mut raw, grid, true, 1);
+            sink.push(&format::transport(display, 64, 285, 4, true, true))
                 .unwrap();
             sink.push(&[7u8; format::ECC_SIZE]).unwrap();
             sink.push(&data).unwrap();
@@ -1060,6 +1223,7 @@ mod tests {
         assert_eq!(parity, 64);
         assert_eq!(protected, 285);
         assert_eq!(source.cell_bits(), 4);
+        assert!(source.chroma());
         let mut ecc = [0; format::ECC_SIZE];
         source.read_exact(&mut ecc).unwrap();
         let mut out = vec![0; data.len()];

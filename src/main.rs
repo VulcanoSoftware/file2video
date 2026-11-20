@@ -5,11 +5,13 @@ mod ecc;
 mod format;
 mod video;
 
+use video::speed;
+
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use format::{CRYPTO_SIZE, ECC_SIZE, Grid, Layout, MAX_KDF, TRANSPORT_SIZE, video_dimension};
 use std::fs::{self, File};
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempfile::NamedTempFile;
@@ -86,6 +88,16 @@ enum Operation {
         #[command(flatten)]
         settings: Encoding,
     },
+    /// Benchmark encode/decode configurations on this machine (backend x mode).
+    Benchmark {
+        /// Use this input file instead of generated random payload.
+        input: Option<PathBuf>,
+        /// MiB of random payload to generate when --input is not used.
+        #[arg(long, default_value_t = 8)]
+        size: u64,
+        #[command(flatten)]
+        settings: Encoding,
+    },
 }
 
 #[derive(Args)]
@@ -135,7 +147,7 @@ enum Profile {
     High,
 }
 
-#[derive(Args)]
+#[derive(Clone, Args)]
 struct Encoding {
     #[arg(long, default_value_t = 1920)]
     width: usize,
@@ -157,6 +169,15 @@ struct Encoding {
     /// Reed-Solomon parity bytes per 255-byte codeword (default: 32, or set by --compress).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=127))]
     ecc_symbols: Option<u8>,
+    /// Store payload cells in the U and V chroma planes too (+50% capacity per
+    /// frame, ~33% fewer frames, same MP4 size; verify with a round trip on
+    /// your GPU encoder first).
+    #[arg(long)]
+    chroma: bool,
+    /// Encode every frame as a keyframe (all-intra): smaller at CRF 6 and
+    /// faster to decode, 10x more cells for error correction to watch.
+    #[arg(long)]
+    intra: bool,
     /// Number of PBKDF2-HMAC-SHA256 iterations.
     #[arg(long, default_value_t = 600_000, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_KDF)))]
     pbkdf2_iterations: u32,
@@ -192,6 +213,8 @@ impl Encoding {
                 preset: self.preset.unwrap_or_else(|| preset.to_owned()),
                 cell_bits: 4,
                 compact: true,
+                chroma: self.chroma,
+                intra: self.intra,
             },
             self.ecc_symbols.map_or(parity, usize::from),
             self.pbkdf2_iterations,
@@ -237,7 +260,8 @@ fn encode(
     output: &Path,
     password: Password,
     options: Encoding,
-) -> Result<()> {
+    quiet: bool,
+) -> Result<u64> {
     let (settings, parity, iterations) = options.resolve()?;
     check_output(output)?;
     regular_file_len(fs::metadata(input)?)?;
@@ -257,11 +281,18 @@ fn encode(
     let password = password.get(true)?;
     let mut crypto = crypto::Stream::new(&header, &password);
     drop(password);
-    let frames = layout.frames(settings.grid, settings.cell_bits);
-    eprintln!(
-        "Encrypting {size} bytes; writing {frames} video frames ({} luma levels per cell).",
-        1 << settings.cell_bits
-    );
+    let frames = layout.frames(settings.grid, settings.cell_bits, settings.chroma);
+    if !quiet {
+        eprintln!(
+            "Encrypting {size} bytes; writing {frames} video frames ({} luma levels per cell{}).",
+            1 << settings.cell_bits,
+            if settings.chroma {
+                ", data in the chroma planes too"
+            } else {
+                ""
+            }
+        );
+    }
 
     // The format places the final GCM tag before the ciphertext. Stage only
     // the ciphertext (never the input file) so the original is read once.
@@ -299,13 +330,14 @@ fn encode(
     let tmp = temporary(dir)?;
     let mut process = tools.encode(&settings, tmp.path())?;
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
-    let mut sink = video::Sink::new(pipe, settings.grid, frames);
+    let mut sink = video::Sink::new(pipe, settings.grid, settings.chroma, frames);
     sink.push(&format::transport(
         settings.display,
         parity,
         layout.protected,
         settings.cell_bits,
         settings.compact,
+        settings.chroma,
     ))?;
     let codec = ecc::Codec::new(parity);
     if settings.compact {
@@ -323,7 +355,8 @@ fn encode(
     }
     sink.finish()?;
     process.finish()?;
-    publish(tmp, output)
+    publish(tmp, output)?;
+    Ok(frames)
 }
 
 fn restorable_name(name: &str) -> Result<&str> {
@@ -393,6 +426,7 @@ fn decode(
         .take()
         .context("missing FFmpeg stdout")?;
     let (mut frames, parity, protected) = video::Source::open(pipe, width, height, options.block)?;
+    let chroma = frames.chroma();
     let grid = frames.grid();
     let cell_bits = frames.cell_bits();
     let codec = ecc::Codec::new(parity);
@@ -412,7 +446,7 @@ fn decode(
     };
     reader
         .input_mut()
-        .set_frames(layout.frames(grid, cell_bits));
+        .set_frames(layout.frames(grid, cell_bits, chroma));
     let mut header = [0; CRYPTO_SIZE];
     reader.read_exact(&mut header)?;
     let header = crypto::Header::parse(&header, layout.encrypted - CRYPTO_SIZE as u64)?;
@@ -465,7 +499,7 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
     } else {
         Layout::new(encrypted, parity)?
     };
-    let frames = layout.frames(settings.grid, settings.cell_bits);
+    let frames = layout.frames(settings.grid, settings.cell_bits, settings.chroma);
     println!("Input:            {size} bytes");
     println!("Encrypted:        {} bytes", layout.encrypted);
     println!(
@@ -493,6 +527,193 @@ fn estimate(input: &Path, options: Encoding) -> Result<()> {
         settings.fps
     );
     println!("MP4 file size depends on H.264 compression and cannot be predicted exactly.");
+    Ok(())
+}
+
+fn generate_payload(path: &Path, mib: u64) -> Result<u64> {
+    ensure!(mib > 0, "--size must be positive");
+    let bytes = mib.saturating_mul(1024 * 1024);
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut file =
+        File::create(path).with_context(|| format!("could not create {}", path.display()))?;
+    let mut buffer = vec![0u8; CHUNK];
+    let mut left = bytes;
+    while left != 0 {
+        let n = (left as usize).min(buffer.len());
+        let chunk = &mut buffer[..n];
+        for word in chunk.as_chunks_mut::<8>().0 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            word.copy_from_slice(&state.to_le_bytes());
+        }
+        for byte in chunk.as_chunks_mut::<8>().1 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        file.write_all(chunk)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        left -= n as u64;
+    }
+    Ok(bytes)
+}
+
+fn files_equal(a: &Path, b: &Path) -> Result<bool> {
+    let mut left = BufReader::new(File::open(a)?);
+    let mut right = BufReader::new(File::open(b)?);
+    let (mut one, mut two) = ([0; 64 * 1024], [0; 64 * 1024]);
+    loop {
+        let l = left.read(&mut one)?;
+        let r = right.read(&mut two)?;
+        if l != r || one[..l] != two[..r] {
+            return Ok(false);
+        }
+        if l == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn benchmark(
+    tools: &video::Tools,
+    input: Option<PathBuf>,
+    size: u64,
+    options: Encoding,
+) -> Result<()> {
+    let temp = tempfile::tempdir().context("could not create a benchmark directory")?;
+    let payload: PathBuf = match input {
+        Some(path) => path,
+        None => {
+            let path = temp.path().join("payload.bin");
+            eprintln!("Generating {size} MiB of pseudo-random payload...");
+            generate_payload(&path, size)?;
+            path
+        }
+    };
+    let bytes = regular_file_len(fs::metadata(&payload)?)?;
+    let mut backends: Vec<(String, video::Gpu)> = Vec::new();
+    if tools.gpu != video::Gpu::Off {
+        if tools.gpu == video::Gpu::Auto {
+            for backend in tools.available_backends() {
+                backends.push((backend.encoder_name().to_owned(), backend));
+            }
+        } else {
+            backends.push((tools.gpu.encoder_name().to_owned(), tools.gpu));
+        }
+    }
+    backends.push(("cpu (libx264)".to_owned(), video::Gpu::Off));
+
+    println!(
+        "Payload: {:.1} MB | {} fps | {} parity symbols | CRF cap 8 (intra: 6)",
+        bytes as f64 / (1024.0 * 1024.0),
+        options.fps,
+        options.ecc_symbols.unwrap_or(32)
+    );
+    println!(
+        "{:<22} {:<15} {:>7} {:>9} {:>10} {:>9} {:>10} {:>10} {:>7}",
+        "Backend",
+        "Mode",
+        "Frames",
+        "Enc time",
+        "Enc speed",
+        "Dec time",
+        "Dec speed",
+        "MP4",
+        "Result"
+    );
+    let mut run = 0usize;
+    let modes: [(&str, bool, bool); 4] = [
+        ("base", false, false),
+        ("intra", true, false),
+        ("chroma", false, true),
+        ("intra+chroma", true, true),
+    ];
+    for (name, gpu) in &backends {
+        let run_tools = video::Tools {
+            ffmpeg: tools.ffmpeg.clone(),
+            ffprobe: tools.ffprobe.clone(),
+            threads: tools.threads,
+            gpu: *gpu,
+        };
+        for (label, intra, chroma) in modes {
+            let mut bench = options.clone();
+            bench.intra = intra;
+            bench.chroma = chroma;
+            bench.crf = None;
+            bench.pbkdf2_iterations = 1000;
+            run += 1;
+            let video_path = temp.path().join(format!("bench-{run}.mp4"));
+            let restored = temp.path().join(format!("restored-{run}"));
+            let started = Instant::now();
+            let outcome = match encode(
+                &run_tools,
+                &payload,
+                &video_path,
+                Password {
+                    password: Some("file2video benchmark".to_owned()),
+                    password_file: None,
+                },
+                bench,
+                true,
+            ) {
+                Ok(frames) => {
+                    let encode_time = started.elapsed().as_secs_f64();
+                    let mp4 = fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
+                    let decode_started = Instant::now();
+                    match decode(
+                        &run_tools,
+                        &video_path,
+                        &restored,
+                        Password {
+                            password: Some("file2video benchmark".to_owned()),
+                            password_file: None,
+                        },
+                        DecodeOptions {
+                            restore_name: false,
+                            width: None,
+                            height: None,
+                            block: None,
+                        },
+                    ) {
+                        Ok(_) => {
+                            let decode_time = decode_started.elapsed().as_secs_f64();
+                            let verified = files_equal(&payload, &restored)?;
+                            if !verified {
+                                Err(anyhow::anyhow!("decoded output does not match the payload"))
+                            } else {
+                                Ok((frames, encode_time, decode_time, mp4))
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok((frames, encode_time, decode_time, mp4)) => println!(
+                    "{:<22} {:<15} {:>7} {:>8.2}s {:>10} {:>8.2}s {:>10} {:>8} MB {:>6}%",
+                    name,
+                    label,
+                    frames,
+                    encode_time,
+                    speed(bytes, encode_time),
+                    decode_time,
+                    speed(bytes, decode_time),
+                    format!("{:.1}", mp4 as f64 / (1024.0 * 1024.0)),
+                    format!("{:.0}", (mp4 as f64 / bytes as f64) * 100.0)
+                ),
+                Err(error) => {
+                    println!(
+                        "{:<22} {:<15} {:>7} {:>8} {:>10} {:>8} {:>10} {:>8} MB {:>6}%",
+                        name, label, "-", "-", "-", "-", "-", "-", "-"
+                    );
+                    eprintln!("{name} {label}: {error:#}");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -549,7 +770,7 @@ fn run() -> Result<()> {
             password,
             settings,
         } => {
-            encode(&tools, &input, &output, password, settings)?;
+            encode(&tools, &input, &output, password, settings, false)?;
             eprintln!(
                 "Wrote {} in {:.2}s.",
                 output.display(),
@@ -584,6 +805,11 @@ fn run() -> Result<()> {
             );
         }
         Operation::Estimate { input, settings } => estimate(&input, settings)?,
+        Operation::Benchmark {
+            input,
+            size,
+            settings,
+        } => benchmark(&tools, input, size, settings)?,
     }
     Ok(())
 }

@@ -2,7 +2,7 @@
 
 Command-line tool that turns any file into an encrypted H.264 MP4 video and restores it byte for byte.
 
-**How it works:** the file (and its name) is encrypted with AES-256-GCM, protected with Reed-Solomon error correction, drawn as cells with 16 brightness levels on video frames, and encoded with x264. Decoding reverses the process and publishes the output only after the password and integrity checks pass.
+**How it works:** the file (and its name) is encrypted with AES-256-GCM, protected with Reed-Solomon error correction, drawn as cells with 16 brightness levels on video frames (optionally also in the color planes), and encoded with x264 or a hardware GPU encoder. Decoding reverses the process and publishes the output only after the password and integrity checks pass.
 
 ## Requirements
 
@@ -72,17 +72,31 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--width`, `--height` | `1920`, `1080` | Storage grid that sets the per-frame capacity. Even numbers, at most 8192 per side and 35.4 megapixels, divisible by the block size. The MP4 itself is stored at cell resolution (256×256 or larger, one cell per pixel) and upscaled while viewing. |
 | `--block-size` | `8` | Pixels per bit. One of `8`, `10`, `12`, `16`, `20`. Larger blocks hold less data per frame, so the video gets longer. |
 | `--fps` | `30` | Frames per second (1–60). |
-| `--crf` | `8` | x264 quality (0–51, lower is better). This mode caps the quality at 8 because every cell must survive H.264 quantization exactly. |
+| `--crf` | `8` | x264 quality (0–51, lower is better). This mode caps the quality at 8 (6 with `--intra`) because every cell must survive H.264 quantization exactly. |
 | `--preset` | `faster` | x264 preset, `ultrafast` to `veryslow`; also selects the speed tier of the hardware GPU encoders. |
+| `--chroma` | off | Also store data in the U and V color planes: +50% capacity per frame with about the same compression, so roughly a third fewer frames and a third faster to encode and decode. Verify with `benchmark` or a round trip, since hardware encoders handle color planes differently. |
+| `--intra` | off | All-intra encoding (`-g 1`): every frame is independent, which makes decoding 20–40% faster at the cost of a somewhat larger MP4. The quality cap drops to 6 to keep the error-correction margin. |
 | `--ecc-symbols` | `32` | Reed-Solomon parity bytes per 255-byte codeword (1–127). |
 | `--compress` | off | Smaller-output profile: `light`, `medium` or `high`. |
 | `--pbkdf2-iterations` | `600000` | PBKDF2-HMAC-SHA256 iterations (1–10,000,000). |
 
-`--compress` sets preset and parity together: `light` = `slow` / 64, `medium` = `slower` / 32, `high` = `veryslow` / 16; CRF stays capped at 8. Explicit `--crf`, `--preset` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
+`--compress` sets preset and parity together: `light` = `slow` / 64, `medium` = `slower` / 32, `high` = `veryslow` / 16; CRF stays capped at 8 (6 with `--intra`). Explicit `--crf`, `--preset`, `--chroma`, `--intra` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
+
+### `benchmark [INPUT]`
+
+Measures every relevant configuration on this machine: each available backend × each mode (default, `--intra`, `--chroma`, both), then prints a table with frames, encode/decode wall time and speed in MB/s, MP4 size and data/MP4 efficiency. Without `--input` it generates pseudo-random payload of `--size` MiB (default 8). Not affected by `--compress`; the password/PBKDF2 speed is not representative because a fixed low iteration count is used.
+
+```sh
+./file2video benchmark                          # all backends x all modes on an 8 MiB payload
+./file2video benchmark --gpu amf --size 64      # only AMF (plus CPU for comparison), 64 MiB
+./file2video benchmark --input archive.zip      # real file, e.g. to check its MP4 size
+```
+
+Backends whose trial encode fails (for example when a GPU driver is missing) are listed with their FFmpeg error. Run it before choosing `--chroma`/`--intra` to see what is fastest on your machine.
 
 ### `decode <INPUT> <OUTPUT>`
 
-Recovers the original file from the video. The resolution, block size and cell depth are detected automatically.
+Recovers the original file from the video. The resolution, block size, cell depth and whether data was stored in the color planes are detected automatically.
 
 - If `OUTPUT` is an existing directory, the file is restored there under its original name.
 - If `OUTPUT` is a file path, the file is written to that name. With `--restore-name` the original name is used instead, in the directory that contains `OUTPUT`.
@@ -136,8 +150,8 @@ Passwords can only contain Latin-1 characters (for example ASCII and `é`). Othe
 
 ## Size, duration and disk space
 
-- **Capacity:** each pixel of the video stores one cell with 4 bits (one of 16 brightness levels), so one frame carries 32,768 bytes at the standard 256×256 cell grid, of which about 28,600 are file data after error correction. That is roughly 860 KB per second of video. 1 MiB takes 37 frames (1.2 s); 1 GiB takes about 37,500 frames (21 minutes).
-- **MP4 size:** the video is stored at cell resolution (256×256 or larger, one cell per pixel) and only upscaled during playback for viewing, so the MP4 tracks the payload size. Compact mode encodes at capped quality (`--crf` is capped at 8) because every cell must survive H.264 quantization intact; for random or compressed data — which H.264 cannot compress — expect roughly 1.7× the input. Use `estimate` for the duration, not the file size.
+- **Capacity:** each pixel of the video stores one cell with 4 bits (one of 16 brightness levels), so one frame carries 32,768 bytes at the standard 256×256 cell grid, of which about 28,600 are file data after error correction. That is roughly 860 KB per second of video. 1 MiB takes 37 frames (1.2 s); 1 GiB takes about 37,500 frames (21 minutes). With `--chroma` the U and V planes carry data too: +50% per frame (1.29 MB per second), so about a third fewer frames and a third faster in both directions at roughly the same MP4 size.
+- **MP4 size:** the video is stored at cell resolution (256×256 or larger, one cell per pixel) and only upscaled during playback for viewing, so the MP4 tracks the payload size. Compact mode encodes at capped quality (`--crf` is capped at 8, or 6 with `--intra`) because every cell must survive H.264 quantization intact; for random or compressed data — which H.264 cannot compress — expect roughly 1.7× the input (about 1.6× with `--intra`). Use `estimate` for the duration, not the file size; use `benchmark` to measure speed and size on your machine.
 - **File size limit:** a single file must be just under 64 GiB (the AES-GCM limit).
 - **Disk space:** `encode` stages the ciphertext in a temporary file in the output directory, because the format stores the authentication tag before the ciphertext. Budget about the input size for that, plus the MP4 itself. `decode` stages the restored file in the output directory before publishing it.
 - **Speed:** encoding uses a hardware GPU encoder when one is available (see [GPU acceleration](#gpu-acceleration)); otherwise x264 at the default `faster` preset dominates encoding time. `--preset veryfast` is even faster at the cost of a different size/quality trade-off; verify the result with a round trip. Error correction runs in parallel and uses AVX2 on x86-64 when available, with a portable fallback.
@@ -157,7 +171,7 @@ Passwords can only contain Latin-1 characters (for example ASCII and `é`). Othe
 - A specific `--gpu` value forces that backend and fails if it is not available in your FFmpeg build or its trial encode fails.
 - The GPU encoder is used for encoding only; decoding always runs on the CPU.
 - `--crf` and `--preset` are translated per backend: constant QP on AMF and VA-API, `-cq` on NVENC, ICQ quality on Quick Sync, and a quality setting on VideoToolbox. The presets map to each encoder's speed levels.
-- Verify the result with a round trip (`encode`, then `decode`, then compare hashes), especially when you use non-default `--crf`, `--preset` or `--compress` settings.
+- Verify the result with a round trip (`encode`, then `decode`, then compare hashes), especially when you use non-default `--crf`, `--preset`, `--chroma`, `--intra` or `--compress` settings. Use `benchmark` to check which backend and modes actually work and how fast they are on your machine.
 - Troubleshooting: when every backend fails, each one prints its FFmpeg trial error (for example `AMF_NO_DLL` means the AMD Adrenalin driver is missing or too old). Update the GPU driver and run again; use `--gpu off` to encode on the CPU without diagnostics.
 
 ## Reliability and security

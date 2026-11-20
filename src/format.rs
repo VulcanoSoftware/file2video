@@ -85,6 +85,7 @@ pub struct Transport {
     pub protected: u64,
     pub cell_bits: u8,
     pub compact: bool,
+    pub chroma: bool,
 }
 
 pub fn transport(
@@ -93,11 +94,16 @@ pub fn transport(
     protected: u64,
     cell_bits: u8,
     compact: bool,
+    chroma: bool,
 ) -> [u8; TRANSPORT_SIZE] {
     let mut header = [0u8; 64];
     header[..8].copy_from_slice(b"CFVID001");
     header[8] = cell_bits;
-    header[9] = u8::from(compact);
+    header[9] = match (compact, chroma) {
+        (true, true) => 2,
+        (true, false) => 1,
+        (false, _) => 0,
+    };
     for (i, n) in [grid.width, grid.height, grid.block, parity]
         .into_iter()
         .enumerate()
@@ -136,8 +142,9 @@ pub fn parse_transport(data: &[u8]) -> Result<Transport> {
         cell_bits == 4,
         "unsupported cell width in the transport header"
     );
-    let compact = vote[9] == 1;
-    ensure!(vote[9] == 0 || compact, "unsupported transport mode");
+    ensure!(vote[9] <= 2, "unsupported transport mode");
+    let compact = vote[9] >= 1;
+    let chroma = vote[9] == 2;
     let width = usize::from(u16_at(&vote, 12));
     let height = usize::from(u16_at(&vote, 14));
     let block = usize::from(u16_at(&vote, 16));
@@ -159,6 +166,7 @@ pub fn parse_transport(data: &[u8]) -> Result<Transport> {
         protected,
         cell_bits,
         compact,
+        chroma,
     })
 }
 
@@ -201,9 +209,13 @@ impl Layout {
         })
     }
 
-    pub fn frames(&self, grid: Grid, cell_bits: u8) -> u64 {
-        ((TRANSPORT_SIZE as u64 + self.protected) * 8)
-            .div_ceil(grid.bits() as u64 * u64::from(cell_bits))
+    pub fn frames(&self, grid: Grid, cell_bits: u8, chroma: bool) -> u64 {
+        let cells = if chroma {
+            grid.bits() + grid.bits() / 2
+        } else {
+            grid.bits()
+        };
+        ((TRANSPORT_SIZE as u64 + self.protected) * 8).div_ceil(cells as u64 * u64::from(cell_bits))
     }
 
     pub fn ecc_header(&self, parity: usize) -> [u8; ECC_SIZE] {
@@ -276,7 +288,25 @@ pub fn parse_metadata(first: &[u8], size: u64) -> Result<(Option<&str>, usize)> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ECC_SIZE, Layout};
+    use super::{ECC_SIZE, Grid, Layout, parse_transport, transport};
+
+    #[test]
+    fn transport_modes_round_trip() {
+        let grid = Grid {
+            width: 256,
+            height: 256,
+            block: 1,
+        };
+        for compact in [false, true] {
+            for chroma in [false, true] {
+                let parsed =
+                    parse_transport(&transport(grid, 64, 285, 4, compact, chroma)).unwrap();
+                assert_eq!(parsed.compact, compact);
+                assert_eq!(parsed.chroma, chroma && compact);
+            }
+        }
+        assert!(parse_transport(&[0u8; 448]).is_err());
+    }
 
     #[test]
     fn compact_layout_protects_the_ecc_header_in_word_zero() {
