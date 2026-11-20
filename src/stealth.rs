@@ -423,20 +423,19 @@ pub(crate) fn encode<R: Read>(
     if settings.intra {
         cmd.args(["-g", "1"]);
     }
-    cmd.arg("-vf")
-        .arg("format=yuv420p")
-        .arg("-filter_threads")
-        .arg("1");
+    cmd.arg("-filter_threads").arg("1");
     let quality;
     match encoder {
         Encoder::Cpu => {
-            cmd.args(["-c:v", "libx264", "-preset", &settings.preset])
+            cmd.args(["-vf", "format=yuv420p"])
+                .args(["-c:v", "libx264", "-preset", &settings.preset])
                 .args(["-crf", &crf])
                 .args(["-threads:v", &tools.threads.to_string()])
                 .args(["-pix_fmt", "yuv420p"]);
         }
         Encoder::Gpu(backend) => {
-            cmd.arg(backend.filter_chain("format=yuv420p"))
+            let chain = backend.filter_chain("format=yuv420p");
+            cmd.args(["-vf", &chain])
                 .args(["-c:v", backend.encoder_name()]);
             quality = backend.quality_args(settings.crf, &settings.preset);
             cmd.args(&quality);
