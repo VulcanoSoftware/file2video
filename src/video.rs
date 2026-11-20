@@ -116,7 +116,7 @@ impl Gpu {
         candidates
     }
 
-    fn device_args(self) -> Vec<String> {
+    pub(crate) fn device_args(self) -> Vec<String> {
         if self == Self::Vaapi {
             vec![
                 "-init_hw_device".to_owned(),
@@ -127,7 +127,7 @@ impl Gpu {
         }
     }
 
-    fn filter_chain(self, scale: &str) -> String {
+    pub(crate) fn filter_chain(self, scale: &str) -> String {
         if self == Self::Vaapi {
             format!("{scale},format=nv12,hwupload")
         } else {
@@ -135,11 +135,11 @@ impl Gpu {
         }
     }
 
-    fn passes_pix_fmt(self) -> bool {
+    pub(crate) fn passes_pix_fmt(self) -> bool {
         self != Self::Vaapi
     }
 
-    fn quality_args(self, crf: u8, preset: &str) -> Vec<String> {
+    pub(crate) fn quality_args(self, crf: u8, preset: &str) -> Vec<String> {
         let mut args = Vec::new();
         match self {
             Self::Amf => {
@@ -404,7 +404,7 @@ impl Tools {
         }
     }
 
-    fn select_encoder(&self, crf: u8) -> Result<Encoder> {
+    pub(crate) fn select_encoder(&self, crf: u8) -> Result<Encoder> {
         if self.gpu == Gpu::Off {
             return Ok(Encoder::Cpu);
         }
@@ -500,7 +500,25 @@ impl Tools {
 
     // FFmpeg added -fps_mode in 5.1 and removed -vsync in 9. Avoid
     // duplicating or dropping frames to match timestamps on either version.
-    fn frame_sync_args(&self) -> Result<[&'static str; 2]> {
+    pub(crate) fn frame_sync_args(&self) -> Result<[&'static str; 2]> {
+        let out = self.version_line()?;
+        Ok(frame_sync_for(&out))
+    }
+
+    // Same version detect as frame_sync_args, but for a constant-frame-rate
+    // output stream (stealth mode forces the looping background to the
+    // output framerate).
+    pub(crate) fn frame_sync_cfr_args(&self) -> Result<[&'static str; 2]> {
+        Ok(
+            if version_of(&self.version_line()?).is_some_and(|v| v < (5, 1)) {
+                ["-vsync", "cfr"]
+            } else {
+                ["-fps_mode", "cfr"]
+            },
+        )
+    }
+
+    fn version_line(&self) -> Result<String> {
         let out = Command::new(&self.ffmpeg)
             .arg("-version")
             .stdin(Stdio::null())
@@ -517,7 +535,7 @@ impl Tools {
             "FFmpeg version check failed ({})",
             out.status
         );
-        Ok(frame_sync_for(&String::from_utf8_lossy(&out.stdout)))
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     fn command(&self) -> Command {
@@ -527,7 +545,7 @@ impl Tools {
         cmd
     }
 
-    fn spawn(&self, mut cmd: Command) -> Result<Process> {
+    pub(crate) fn spawn(&self, mut cmd: Command) -> Result<Process> {
         // Capture the child's stderr in a draining thread; keeping only the
         // last lines means a mid-run failure reports the actual FFmpeg error
         // instead of a bare broken pipe, without risking a full pipe buffer.
@@ -568,7 +586,7 @@ impl Tools {
     }
 }
 
-enum Encoder {
+pub(crate) enum Encoder {
     Cpu,
     Gpu(Gpu),
 }
@@ -664,12 +682,12 @@ fn vt_quality(crf: u8) -> u8 {
     100u8.saturating_sub(crf)
 }
 
-fn frame_sync_for(version_line: &str) -> [&'static str; 2] {
+fn version_of(version_line: &str) -> Option<(u32, u32)> {
     let version = version_line
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(2));
-    let version = version.and_then(|v| {
+    version.and_then(|v| {
         let mut parts = v.trim_start_matches('n').split('.');
         let major: u32 = parts.next()?.parse().ok()?;
         let minor = parts
@@ -678,8 +696,11 @@ fn frame_sync_for(version_line: &str) -> [&'static str; 2] {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         Some((major, minor))
-    });
-    if version.is_some_and(|v| v < (5, 1)) {
+    })
+}
+
+fn frame_sync_for(version_line: &str) -> [&'static str; 2] {
+    if version_of(version_line).is_some_and(|v| v < (5, 1)) {
         ["-vsync", "0"]
     } else {
         ["-fps_mode", "passthrough"]

@@ -236,3 +236,96 @@ fn optimise_uses_and_updates_the_calibration_file() {
         "{text}"
     );
 }
+
+#[test]
+fn stealth_round_trip_with_looping_background_audio() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut seed = 0x517c_c0deu32;
+    let data: Vec<u8> = (0..12_288u32)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    fs::write(dir.join("payload.bin"), &data).unwrap();
+
+    // One second of 240x144 background video with an audio track; the data
+    // layer needs far more frames than that, so both streams must loop.
+    success(
+        Command::new("ffmpeg")
+            .current_dir(dir)
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=240x144:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "dummy.mp4",
+            ])
+            .output()
+            .unwrap(),
+    );
+    success(cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth.mp4",
+            "--stealth",
+            "dummy.mp4",
+            "--fps",
+            "10",
+            "--preset",
+            "ultrafast",
+            "--password",
+            "a",
+            "--pbkdf2-iterations",
+            "1000",
+        ],
+    ));
+
+    let probe = Command::new("ffprobe")
+        .current_dir(dir)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            "stealth.mp4",
+        ])
+        .output()
+        .unwrap();
+    assert!(probe.status.success());
+    assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "audio");
+
+    success(cli(
+        dir,
+        &["decode", "stealth.mp4", "restored.bin", "--password", "a"],
+    ));
+    assert_eq!(fs::read(dir.join("restored.bin")).unwrap(), data);
+}

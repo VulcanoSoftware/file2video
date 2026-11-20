@@ -80,6 +80,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--compress` | off | Smaller-output profile: `light`, `medium` or `high`. |
 | `--pbkdf2-iterations` | `600000` | PBKDF2-HMAC-SHA256 iterations (1–10,000,000). |
 | `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). |
+| `--stealth <VIDEO>` | off | Hide the data as a faint luma layer over a background video instead of storing cells; decoding is blind and does not need that video again. See [Stealth mode](#stealth-mode). |
 
 `--compress` sets preset and parity together: `light` = `slow` / 64, `medium` = `slower` / 32, `high` = `veryslow` / 16; CRF stays capped at 8 (6 with `--intra`). Explicit `--crf`, `--preset`, `--chroma`, `--intra` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
 
@@ -118,9 +119,34 @@ How it works:
 - `estimate` shows which configuration `--optimise` would pick on this machine; it only reads the calibration file and never benchmarks.
 - Encoding failures are retried once: when a configuration that `--optimise` selected turns out to fail (mid-encode FFmpeg errors do exist, see the AMF chroma note at [GPU acceleration](#gpu-acceleration)), the tool prints a warning and finishes the encode with your configured settings.
 
+## Stealth mode
+
+With `--stealth <VIDEO>`, `encode` does not store cells at all. Instead it hides the file as a faint, semi-transparent data layer over a background video you provide (for example gameplay footage). To a viewer the result looks like the original footage with a light digital-noise filter:
+
+```sh
+./file2video encode backup.zip hidden.mp4 --stealth gameplay.mp4 --password s3cret
+./file2video decode hidden.mp4 backup.zip --password s3cret   # no gameplay.mp4 needed
+```
+
+How it works:
+
+- The data layer only touches the **brightness (Y) channel**; the colours (U/V) of the background stay untouched. The frame is divided into rows of 6×6-pixel block pairs; each pair stores one bit by shifting the pair's mean luma towards one block or the other (±25/255, about 10% brightness). Base values are clamped to 30–225 and the shift is applied around the pair's mean, so the bit survives strong background gradients and re-encoding (tested through CRF 18, the default).
+- A checkerboard anchor pattern along the frame edges lets the decoder align the grid even after scaling or a few dropped frames.
+- The background video is looped (`-stream_loop -1`) for both picture and audio as long as data remains, and its audio is muxed into the output; `-shortest` ends the video with the last data frame.
+- Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each bit by comparing the mean luma of block A versus block B. You never need the background video again.
+- Because re-encoded guerrilla data (streaming platforms use VP9/AV1) demands extra robustness, stealth defaults to 96 Reed-Solomon parity symbols per codeword (~38% redundancy) and CRF 18.
+- Dimensions default to the background video's resolution rounded down to a multiple of 6 (the block size); `--width`, `--height`, `--fps`, `--crf`, `--preset`, `--ecc-symbols`, `--intra` and their config-file equivalents override the defaults as usual.
+
+Limitations:
+
+- `--chroma` (the colour planes carry background colours) and `--optimise` (calibration profiles only cover the cell format) cannot be combined with `--stealth`.
+- `estimate` and `benchmark` have no stealth support; use them in normal mode only.
+- The 8-byte sync marker and the transport header are outside the Reed-Solomon protection. If the opening frames of the video are damaged so badly that anchors or header cannot be parsed, decoding stops; the file payload itself enjoys the full parity budget.
+- Capacity per frame is much lower than the cell format (a 1920×1080 frame holds ~3.5 KB instead of ~130 KB), so the same file takes far more playback duration in stealth mode — this mode trades capacity for invisibility.
+
 ### `decode <INPUT> <OUTPUT>`
 
-Recovers the original file from the video. The resolution, block size, cell depth and whether data was stored in the color planes are detected automatically.
+Recovers the original file from the video. The resolution, block size, cell depth and whether data was stored in the color planes are detected automatically. The [stealth format](#stealth-mode) is also detected automatically: when the regular decoder rejects the first frame, the blind stealth decoder tries next.
 
 - If `OUTPUT` is an existing directory, the file is restored there under its original name.
 - If `OUTPUT` is a file path, the file is written to that name. With `--restore-name` the original name is used instead, in the directory that contains `OUTPUT`.

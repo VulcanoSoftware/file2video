@@ -5,6 +5,7 @@ mod diag;
 mod download;
 mod ecc;
 mod format;
+mod stealth;
 mod video;
 
 use calibrate::{Calibration, Target};
@@ -75,6 +76,11 @@ enum Operation {
         password: Password,
         #[command(flatten)]
         settings: Encoding,
+        /// Hide the data as a faint differential-luma layer over this
+        /// background video; decoding is blind and does not need it again
+        /// (see the README, "Stealth mode").
+        #[arg(long, value_name = "VIDEO_PATH")]
+        stealth: Option<PathBuf>,
     },
     /// Recover and authenticate an original file from an MP4 video.
     Decode {
@@ -131,13 +137,15 @@ struct Password {
 }
 
 impl Password {
-    fn get(self, confirm: bool) -> Result<Zeroizing<Vec<u8>>> {
-        let value = Zeroizing::new(if let Some(s) = self.password {
-            s
-        } else if let Some(path) = self.password_file {
+    // Borrows the stored password so a failed regular decode can retry the
+    // same credentials in stealth mode.
+    fn get(&self, confirm: bool) -> Result<Zeroizing<Vec<u8>>> {
+        let value = Zeroizing::new(if let Some(s) = &self.password {
+            s.clone()
+        } else if let Some(path) = &self.password_file {
             const LIMIT: u64 = 65536;
             let mut text = String::new();
-            File::open(&path)?
+            File::open(path)?
                 .take(LIMIT + 1)
                 .read_to_string(&mut text)?;
             ensure!(text.len() as u64 <= LIMIT, "password file is too large");
@@ -292,6 +300,46 @@ fn regular_file_len(meta: fs::Metadata) -> Result<u64> {
     Ok(meta.len())
 }
 
+// Encrypts the plaintext into a scratch file and returns the crypto header
+// plus the staged ciphertext; the header bytes are what the video writers
+// prepend to the ciphertext stream.
+fn encrypt_stream<R: Read>(
+    mut source: R,
+    plain_size: u64,
+    password: &Zeroizing<Vec<u8>>,
+    iterations: u32,
+    dir: &Path,
+) -> Result<(crypto::Header, File)> {
+    let mut header = crypto::Header::new(iterations, plain_size)?;
+    let mut crypto = crypto::Stream::new(&header, password);
+    let mut staged = tempfile::tempfile_in(dir).with_context(|| {
+        format!(
+            "could not create ciphertext scratch file in {}",
+            dir.display()
+        )
+    })?;
+    let mut buffer = Zeroizing::new(vec![0; CHUNK]);
+    let mut left = plain_size;
+    while left != 0 {
+        let n = left.min(CHUNK as u64) as usize;
+        let chunk = &mut buffer[..n];
+        source
+            .read_exact(chunk)
+            .context("could not read input file (it may have shrunk)")?;
+        crypto.update(chunk, true)?;
+        staged
+            .write_all(chunk)
+            .context("could not stage ciphertext (check free disk space)")?;
+        left -= n as u64;
+    }
+    ensure!(
+        source.read(&mut [0])? == 0,
+        "input file grew while encoding"
+    );
+    (header.tag, header.hash) = crypto.finish()?;
+    Ok((header, staged))
+}
+
 fn encode(
     tools: &video::Tools,
     input: &Path,
@@ -309,7 +357,6 @@ fn encode(
     let plain_size = size
         .checked_add(metadata.len() as u64)
         .context("input size overflow")?;
-    let mut header = crypto::Header::new(iterations, plain_size)?;
     let encrypted_size = plain_size + CRYPTO_SIZE as u64;
     let layout = if settings.compact {
         Layout::compact(encrypted_size, parity)?
@@ -317,8 +364,6 @@ fn encode(
         Layout::new(encrypted_size, parity)?
     };
     let password = password.get(true)?;
-    let mut crypto = crypto::Stream::new(&header, &password);
-    drop(password);
 
     let mut tools = tools.clone();
     let original_gpu = tools.gpu;
@@ -343,32 +388,14 @@ fn encode(
     // The format places the final GCM tag before the ciphertext. Stage only
     // the ciphertext (never the input file) so the original is read once.
     let dir = parent(output);
-    let mut staged = tempfile::tempfile_in(dir).with_context(|| {
-        format!(
-            "could not create ciphertext scratch file in {}",
-            dir.display()
-        )
-    })?;
-    let mut source = metadata.as_slice().chain(file);
-    let mut buffer = Zeroizing::new(vec![0; CHUNK]);
-    let mut left = plain_size;
-    while left != 0 {
-        let n = left.min(CHUNK as u64) as usize;
-        let chunk = &mut buffer[..n];
-        source
-            .read_exact(chunk)
-            .context("could not read input file (it may have shrunk)")?;
-        crypto.update(chunk, true)?;
-        staged
-            .write_all(chunk)
-            .context("could not stage ciphertext (check free disk space)")?;
-        left -= n as u64;
-    }
-    ensure!(
-        source.read(&mut [0])? == 0,
-        "input file grew while encoding"
-    );
-    (header.tag, header.hash) = crypto.finish()?;
+    let (header, mut staged) = encrypt_stream(
+        metadata.as_slice().chain(file),
+        plain_size,
+        &password,
+        iterations,
+        dir,
+    )?;
+    drop(password);
     let ecc_header = layout.ecc_header(parity);
     let mut written = None;
     let mut attempt = settings;
@@ -461,6 +488,106 @@ fn write_video<R: Read>(
         process.finish()?;
         Ok(tmp)
     })()
+}
+
+/// Encodes the file as a faint differential-luma data layer over a looping
+/// background video. Calibration profiles do not apply: the stealth layer is
+/// modulated into normal gameplay footage, not into cells.
+#[allow(clippy::too_many_arguments)]
+fn encode_stealth(
+    tools: &video::Tools,
+    input: &Path,
+    output: &Path,
+    background: &Path,
+    password: Password,
+    options: Encoding,
+    ctx: &Ctx,
+) -> Result<u64> {
+    ensure!(
+        !matches!(options.chroma, Some(true)) && ctx.config.chroma != Some(true),
+        "--chroma cannot be combined with --stealth; the chroma planes carry the background colours"
+    );
+    ensure!(
+        options.optimise_target(ctx.config) == Target::Off,
+        "--optimise cannot be combined with --stealth; calibration profiles only cover the cell format"
+    );
+    let (bg_width, bg_height) = tools
+        .dimensions(background)
+        .context("could not probe the stealth background video")?;
+    let width = options
+        .width
+        .or(ctx.config.width)
+        .unwrap_or_else(|| bg_width / stealth::BLOCK * stealth::BLOCK);
+    let height = options
+        .height
+        .or(ctx.config.height)
+        .unwrap_or_else(|| bg_height / stealth::BLOCK * stealth::BLOCK);
+    let geometry = stealth::Geometry::new(width, height)?;
+    let fps = options.fps.or(ctx.config.fps).unwrap_or(30);
+    let crf = options.crf.or(ctx.config.crf).unwrap_or(18);
+    let preset = options
+        .preset
+        .clone()
+        .or_else(|| ctx.config.preset.clone())
+        .unwrap_or_else(|| "faster".to_owned());
+    let intra = options.intra.or(ctx.config.intra).unwrap_or(false);
+    let parity = usize::from(options.ecc_symbols.or(ctx.config.ecc_symbols).unwrap_or(96));
+    let iterations = options
+        .pbkdf2_iterations
+        .or(ctx.config.pbkdf2_iterations)
+        .unwrap_or(600_000);
+    check_output(output)?;
+    regular_file_len(fs::metadata(input)?)?;
+    let file = File::open(input)?;
+    let size = regular_file_len(file.metadata()?)?;
+    let metadata = format::metadata(input, size)?;
+    let plain_size = size
+        .checked_add(metadata.len() as u64)
+        .context("input size overflow")?;
+    let encrypted_size = plain_size + CRYPTO_SIZE as u64;
+    let layout = Layout::compact(encrypted_size, parity)?;
+    let password = password.get(true)?;
+    let dir = parent(output);
+    let (header, mut staged) = encrypt_stream(
+        metadata.as_slice().chain(file),
+        plain_size,
+        &password,
+        iterations,
+        dir,
+    )?;
+    drop(password);
+    staged.rewind()?;
+    let frames = (8 + TRANSPORT_SIZE as u64 + layout.protected - ECC_SIZE as u64)
+        .div_ceil(u64::try_from(geometry.frame_bytes()).context("frame capacity overflow")?);
+    if !ctx.quiet {
+        eprintln!(
+            "Encoding {size} bytes as a stealth layer over {} at {}x{}, {} fps, CRF {crf}, {parity} parity symbols; writing {frames} frames.",
+            background.display(),
+            width,
+            height,
+            fps
+        );
+    }
+    let crypto_header = header.bytes();
+    let mut stream = crypto_header.as_slice().chain(&mut staged);
+    let tmp = stealth::encode(
+        tools,
+        background,
+        &stealth::StealthSettings {
+            width,
+            height,
+            fps,
+            crf,
+            preset,
+            intra,
+            parity,
+        },
+        layout,
+        dir,
+        &mut stream,
+    )?;
+    publish(tmp, output)?;
+    Ok(frames)
 }
 
 fn quick_calibration(tools: &video::Tools, options: &Encoding, ctx: &Ctx) -> Result<Calibration> {
@@ -593,11 +720,15 @@ struct DecodeOptions {
     block: Option<usize>,
 }
 
+const NOT_A_FILE2VIDEO_VIDEO: &str = "not a file2video video; wrong layout or damaged first frame";
+
+/// Decodes a regular (cell-based) video, and falls back to the blind stealth
+/// decoder automatically when the first frame carries no cell layout.
 fn decode(
     tools: &video::Tools,
     input: &Path,
     output: &Path,
-    password: Password,
+    password: &Password,
     options: DecodeOptions,
 ) -> Result<PathBuf> {
     regular_file_len(fs::metadata(input)?)?;
@@ -612,6 +743,31 @@ fn decode(
     } else {
         tools.dimensions(input)?
     };
+    match decode_regular(
+        tools, input, output, password, &options, width, height, dir, is_dir,
+    ) {
+        Err(error) if error.to_string().contains(NOT_A_FILE2VIDEO_VIDEO) => {
+            eprintln!("Not a regular file2video video; trying the stealth decoder...");
+            decode_stealth(
+                tools, input, output, password, &options, width, height, dir, is_dir,
+            )
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_regular(
+    tools: &video::Tools,
+    input: &Path,
+    output: &Path,
+    password: &Password,
+    options: &DecodeOptions,
+    width: usize,
+    height: usize,
+    dir: &Path,
+    is_dir: bool,
+) -> Result<PathBuf> {
     let mut process = tools.decode(input)?;
     let pipe = process
         .child
@@ -640,6 +796,59 @@ fn decode(
     reader
         .input_mut()
         .set_frames(layout.frames(grid, cell_bits, chroma));
+    let (tmp, name) = decrypt_staged(reader, layout, password, dir)?;
+    frames.finish()?;
+    process.finish()?;
+    let destination = destination_for(name, output, dir, is_dir, options.restore_name)?;
+    publish(tmp, &destination)?;
+    Ok(destination)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_stealth(
+    tools: &video::Tools,
+    input: &Path,
+    output: &Path,
+    password: &Password,
+    options: &DecodeOptions,
+    width: usize,
+    height: usize,
+    dir: &Path,
+    is_dir: bool,
+) -> Result<PathBuf> {
+    let mut process = tools.decode(input)?;
+    let pipe = process
+        .child
+        .stdout
+        .take()
+        .context("missing FFmpeg stdout")?;
+    let mut reader = stealth::Reader::open(pipe, width, height)?;
+    let parity = reader.parity();
+    let protected = reader.protected();
+    let codec = ecc::Codec::new(parity);
+    // Plain allowance for the codewords: words carry 255 - parity data
+    // bytes each, which is all the encoder ever wrote.
+    let words = (protected - ECC_SIZE as u64) / 255;
+    let mut stream = codec.reader(&mut reader, words * (255 - parity) as u64);
+    let mut ecc_header = [0; ECC_SIZE];
+    stream.read_exact(&mut ecc_header)?;
+    let layout = Layout::parse(&ecc_header, parity, protected, true)?;
+    let (tmp, name) = decrypt_staged(stream, layout, password, dir)?;
+    reader.finish()?;
+    process.finish()?;
+    let destination = destination_for(name, output, dir, is_dir, options.restore_name)?;
+    publish(tmp, &destination)?;
+    Ok(destination)
+}
+
+/// Decrypts, authenticates, and stages the plaintext from an ECC reader; the
+/// reader must already sit at the first codeword byte.
+fn decrypt_staged<R: Read>(
+    mut reader: ecc::Reader<'_, R>,
+    layout: Layout,
+    password: &Password,
+    dir: &Path,
+) -> Result<(NamedTempFile, Option<String>)> {
     let mut header = [0; CRYPTO_SIZE];
     reader.read_exact(&mut header)?;
     let header = crypto::Header::parse(&header, layout.encrypted - CRYPTO_SIZE as u64)?;
@@ -667,17 +876,23 @@ fn decode(
         left -= n as u64;
     }
     crypto.verify(&header)?;
-    drop(reader);
-    frames.finish()?;
-    process.finish()?;
     let (name, _) = metadata?;
-    let destination = match (name, is_dir, options.restore_name) {
-        (Some(name), true, _) | (Some(name), _, true) => dir.join(restorable_name(&name)?),
+    drop(reader);
+    Ok((tmp, name))
+}
+
+fn destination_for(
+    name: Option<String>,
+    output: &Path,
+    dir: &Path,
+    is_dir: bool,
+    restore_name: bool,
+) -> Result<PathBuf> {
+    match (name, is_dir, restore_name) {
+        (Some(name), true, _) | (Some(name), _, true) => Ok(dir.join(restorable_name(&name)?)),
         (None, true, _) => bail!("video has no stored filename; specify an output filename"),
-        _ => output.to_owned(),
-    };
-    publish(tmp, &destination)?;
-    Ok(destination)
+        _ => Ok(output.to_owned()),
+    }
 }
 
 fn estimate(tools: &video::Tools, input: &Path, options: Encoding, ctx: &Ctx) -> Result<()> {
@@ -883,7 +1098,7 @@ fn run_matrix(
                     &run_tools,
                     &video_path,
                     &restored,
-                    password_for("file2video benchmark"),
+                    &password_for("file2video benchmark"),
                     DecodeOptions {
                         restore_name: false,
                         width: None,
@@ -1098,10 +1313,23 @@ fn run() -> Result<()> {
             output,
             password,
             settings,
+            stealth,
         } => {
-            encode(&tools, &input, &output, password, settings, &ctx)?;
+            let frames = match stealth {
+                Some(background) => encode_stealth(
+                    &tools,
+                    &input,
+                    &output,
+                    &background,
+                    password,
+                    settings,
+                    &ctx,
+                )?,
+                None => encode(&tools, &input, &output, password, settings, &ctx)?,
+            };
             eprintln!(
-                "Wrote {} in {:.2}s.",
+                "Wrote {} frames in {} in {:.2}s.",
+                frames,
                 output.display(),
                 start.elapsed().as_secs_f64()
             );
@@ -1119,7 +1347,7 @@ fn run() -> Result<()> {
                 &tools,
                 &input,
                 &output,
-                password,
+                &password,
                 DecodeOptions {
                     restore_name,
                     width,
