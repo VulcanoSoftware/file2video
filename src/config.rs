@@ -51,6 +51,7 @@ pub struct Config {
     pub stealth_intensity: Option<usize>,
     pub stealth_block: Option<usize>,
     pub stealth_dense: Option<bool>,
+    pub stealth_no_audio: Option<bool>,
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -150,6 +151,10 @@ impl Config {
                 }
                 "stealth_dense" => {
                     config.stealth_dense =
+                        Some(parse_bool(value).with_context(|| which().clone())?);
+                }
+                "stealth_no_audio" => {
+                    config.stealth_no_audio =
                         Some(parse_bool(value).with_context(|| which().clone())?);
                 }
                 "intra" => {

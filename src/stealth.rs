@@ -203,8 +203,13 @@ pub struct StealthSettings {
     pub crf: u8,
     pub preset: String,
     pub intra: bool,
-    /// Reed-Solomon parity per 255-byte codeword. Stealth defaults to 96,
-    /// roughly 38% redundancy, so heavy compression noise stays correctable.
+    /// Mux the looping background's audio into the output as AAC (the
+    /// default); `--stealth-no-audio`/`stealth_no_audio` turns it off.
+    pub audio: bool,
+    /// Reed-Solomon parity per 255-byte codeword. Stealth defaults to 64
+    /// (25% redundancy); the older 96-symbol default cost ~25% more frames
+    /// and output size without rescuing a re-encoded dense layer in any
+    /// measured round trip.
     pub parity: usize,
 }
 
@@ -734,7 +739,11 @@ pub(crate) fn encode<R: Read>(
             "-i",
         ])
         .arg(local_path(background))
-        .args(["-map", "0:v", "-map", "1:a:0?", "-shortest"]);
+        .args(if settings.audio {
+            vec!["-map", "0:v", "-map", "1:a:0?", "-shortest"]
+        } else {
+            vec!["-map", "0:v", "-shortest"]
+        });
     if let Encoder::Gpu(backend) = encoder {
         for arg in backend.device_args() {
             cmd.arg(arg);
@@ -764,7 +773,10 @@ pub(crate) fn encode<R: Read>(
             }
         }
     }
-    cmd.args(["-c:a", "aac", "-b:a", "192k", "-f", "mp4"])
+    if settings.audio {
+        cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+    }
+    cmd.args(["-f", "mp4"])
         .arg(local_path(tmp.path()))
         .stdin(Stdio::piped())
         .stdout(Stdio::null());

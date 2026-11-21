@@ -571,6 +571,141 @@ fn stealth_round_trip_with_looping_background_audio() {
 }
 
 #[test]
+fn stealth_round_trip_without_background_audio() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut seed = 0x517c_c0deu32;
+    let data: Vec<u8> = (0..12_288u32)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    fs::write(dir.join("payload.bin"), &data).unwrap();
+
+    // One second of 240x144 background video with an audio track, like the
+    // audio test above; here the flag must keep the audio out entirely.
+    success(
+        Command::new("ffmpeg")
+            .current_dir(dir)
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=240x144:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "dummy.mp4",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    // --stealth-no-audio drops the background's audio stream; the data layer
+    // must still restore byte for byte.
+    let encoded = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-silent.mp4",
+            "--stealth",
+            "dummy.mp4",
+            "--stealth-no-audio",
+            "--fps",
+            "10",
+            "--preset",
+            "ultrafast",
+            "--no-password",
+        ],
+    );
+    success(encoded.clone());
+    let stderr = String::from_utf8_lossy(&encoded.stderr);
+    assert!(
+        stderr.contains("without background audio"),
+        "expected the no-audio note in the message, got: {stderr}"
+    );
+    let probe = Command::new("ffprobe")
+        .current_dir(dir)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            "stealth-silent.mp4",
+        ])
+        .output()
+        .unwrap();
+    assert!(probe.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&probe.stdout).trim(),
+        "",
+        "the stealth output must not carry an audio stream"
+    );
+
+    // The config-file form of the switch does the same thing.
+    fs::write(dir.join("file2video.conf"), "stealth_no_audio = on\n").unwrap();
+    let configured = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-silent-cfg.mp4",
+            "--stealth",
+            "dummy.mp4",
+            "--fps",
+            "10",
+            "--preset",
+            "ultrafast",
+            "--no-password",
+        ],
+    );
+    success(configured.clone());
+    let stderr = String::from_utf8_lossy(&configured.stderr);
+    assert!(
+        stderr.contains("without background audio"),
+        "expected the config's stealth_no_audio to apply, got: {stderr}"
+    );
+    success(cli(
+        dir,
+        &["decode", "stealth-silent.mp4", "restored-silent.bin"],
+    ));
+    assert_eq!(fs::read(dir.join("restored-silent.bin")).unwrap(), data);
+    success(cli(
+        dir,
+        &[
+            "decode",
+            "stealth-silent-cfg.mp4",
+            "restored-silent-cfg.bin",
+        ],
+    ));
+    assert_eq!(fs::read(dir.join("restored-silent-cfg.bin")).unwrap(), data);
+}
+
+#[test]
 fn stealth_dense_with_configured_intensity_round_trips() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
