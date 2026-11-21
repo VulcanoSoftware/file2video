@@ -82,7 +82,7 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--no-password` | off | Store the file without encryption: anyone who downloads the video can read it. A SHA-256 integrity check still protects against damaged videos; decoding never asks for a password. |
 | `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). In stealth mode only the backend and all-intra choice apply. |
 | `--stealth <VIDEO>` | off | Hide the data as a faint luma layer over a background video instead of storing cells; decoding is blind and does not need that video again. See [Stealth mode](#stealth-mode). |
-| `--stealth-block <PIXELS>` | `6` | Stealth mode only: modulation block size (even, 2–16). Smaller blocks carry more data per frame and encode proportionally faster; see [Stealth mode](#stealth-mode). |
+| `--stealth-block <PIXELS>` | `4` | Stealth mode only: modulation block size (even, 2–16). Smaller blocks carry more data per frame and encode proportionally faster; the default 4 brings a stealth encode close to a normal encode's wall time. Use 6 for maximum robustness against aggressive re-encoding. See [Stealth mode](#stealth-mode). |
 
 `--compress` sets preset and parity together: `light` = `slow` / 64, `medium` = `slower` / 32, `high` = `veryslow` / 16; CRF stays capped at 8 (6 with `--intra`). Explicit `--crf`, `--preset`, `--chroma`, `--intra` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
 
@@ -140,13 +140,13 @@ How it works:
 - Because re-encoded guerrilla data (streaming platforms use VP9/AV1) demands extra robustness, stealth defaults to 96 Reed-Solomon parity symbols per codeword (~38% redundancy) and CRF 18.
 - Dimensions default to the background video's resolution rounded down to a multiple of the block size; `--width`, `--height`, `--fps`, `--crf`, `--preset`, `--ecc-symbols`, `--intra` and their config-file equivalents override the defaults as usual.
 
-Speed: every block pair carries two bits, so the block size directly sets the throughput. The default 6 favours robustness; `--stealth-block 4` carries 2.25x as much per frame, and `--stealth-block 2` up to 9x as much. Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; encode wall time is typically a fraction of it on GPU-capable machines, decode the same again):
+Speed: every block pair carries two bits, so the block size directly sets the throughput. The default 4 is the speed lever that makes the stealth pipeline roughly as fast as a normal encode on most machines; `--stealth-block 2` carries 4x as much per frame again, while `--stealth-block 6` trades throughput for maximum robustness against aggressive re-encoding (YouTube, streaming platforms). Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; on the default block 4 the encode wall time is comparable to a normal cell-format encode, decode the same again):
 
 | Block | Bytes/frame | Playback throughput | Video duration for 1 GiB |
 | --- | --- | --- | --- |
-| 6 (default) | 6,996 | 0.21 MB/s | ~1.4 hours |
-| 4 | 15,892 | 0.48 MB/s | ~38 minutes |
-| 2 | 64,186 | 1.93 MB/s | ~9 minutes |
+| 4 (default) | 15,892 | 0.48 MB/s | ~38 minutes |
+| 6 (robustness) | 6,996 | 0.21 MB/s | ~1.4 hours |
+| 2 (fastest) | 64,186 | 1.93 MB/s | ~9 minutes |
 
 Other levers, measured on a 1278×720 CPU-only encode of 5 MiB (your numbers vary by machine — the GPU encoder is otherwise idle and leaves the CPU to the error correction):
 
@@ -155,12 +155,12 @@ Other levers, measured on a 1278×720 CPU-only encode of 5 MiB (your numbers var
 - `--fps` does not change encode or decode time either; it only shortens the video's playback duration (the same 593 frames at 60 fps last half as long and look even more like regular footage).
 - `--optimise smallest` inherits the all-intra choice from cell-format profiles, which is rarely the speed-optimal frame mode for a CRF 18 stealth layer; when stealth speed matters, prefer `--optimise fastest` or drop `--optimise` entirely, and try the explicit `--gpu` backends.
 
-Combined, `--stealth-block 2 --preset ultrafast --fps 60` measured ~7.5x the default settings on the reference machine, byte-identical round trip. Use smaller block sizes and faster presets when your distribution channel is gentle (direct file transfer, mild re-encoding); keep the default block 6 and CRF 18 when the video will be re-encoded aggressively (YouTube, streaming platforms).
+Combined, `--stealth-block 2 --preset ultrafast --fps 60` measured ~7.5x the old default block 6 on the reference machine, byte-identical round trip. Use smaller block sizes and faster presets when your distribution channel is gentle (direct file transfer, mild re-encoding); keep `--stealth-block 6` and CRF 18 when the video will be re-encoded aggressively (YouTube, streaming platforms).
 
-Example: encode a 1 GiB archive as a stealth layer at 2.25x the default density:
+Example: encode a 1 GiB archive as a stealth layer at the maximum-robustness setting (the default encoder settings without `--stealth-block` are already 2.25x denser and proportionally faster):
 
 ```sh
-./file2video encode backup.zip hidden.mp4 --stealth gameplay.mp4 --stealth-block 4 --password s3cret
+./file2video encode backup.zip hidden.mp4 --stealth gameplay.mp4 --stealth-block 6 --password s3cret
 ```
 
 Limitations:
@@ -168,7 +168,7 @@ Limitations:
 - A `--chroma` request (explicit flag or config default) is ignored with a warning: the chroma planes carry the background colours. An `--optimise` target (explicit flag or config default) does apply to stealth: the calibrated encoder backend and all-intra choice are used, only its chroma part never is. The profiles were measured on the cell format, so the choice is a hardware-level hint for stealth encodes rather than an exact stealth measurement; a warning says as much, and a `chroma = on` / `optimise = ...` config tuned for cell encodes never blocks a stealth encode.
 - `estimate` and `benchmark` have no stealth support; use them in normal mode only.
 - The 8-byte sync marker and the transport header are outside the Reed-Solomon protection. If the opening frames of the video are damaged so badly that anchors or header cannot be parsed, decoding stops; the file payload itself enjoys the full parity budget.
-- Capacity per frame is much lower than the cell format (a 1920×1080 frame holds ~7 KB instead of ~130 KB), so the same file takes far more playback duration in stealth mode — this mode trades capacity for invisibility.
+- Capacity per frame is much lower than the cell format (a default block 4 1920×1080 frame holds ~16 KB instead of ~130 KB), so the same file takes far more playback duration in stealth mode — this mode trades capacity for invisibility.
 
 ### `decode <INPUT> <OUTPUT>`
 

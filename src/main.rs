@@ -87,11 +87,12 @@ enum Operation {
         /// (see the README, "Stealth mode").
         #[arg(long, value_name = "VIDEO_PATH")]
         stealth: Option<PathBuf>,
-        /// Stealth modulation block size in pixels (even, 2-16, default 6).
+        /// Stealth modulation block size in pixels (even, 2-16, default 4).
         /// Each bit costs two blocks of pixels, so smaller blocks carry more
-        /// data per frame and encode proportionally faster: block 4 gives
-        /// about 2.3-3x the default throughput, block 2 up to 8-9x, at the
-        /// cost of some robustness to heavy re-encoding.
+        /// data per frame and encode proportionally faster: block 2 gives
+        /// about 4x the default throughput. Larger blocks (6, default 4
+        /// alternative) trade throughput for robustness to heavy
+        /// re-encoding such as YouTube.
         #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u16).range(2..=16))]
         stealth_block: Option<u16>,
     },
@@ -665,6 +666,7 @@ fn encode_stealth(
         &stealth::StealthSettings {
             width,
             height,
+            rescale: width != bg_width || height != bg_height,
             block,
             fps,
             crf,

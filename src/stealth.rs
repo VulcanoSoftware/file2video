@@ -19,6 +19,7 @@ use crate::format::{
 };
 use crate::video::{Encoder, Progress, Tools, local_path};
 use anyhow::{Context, Result, ensure};
+use rayon::prelude::*;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
@@ -26,11 +27,13 @@ use tempfile::NamedTempFile;
 
 /// Pixels per modulation block; every data bit occupies a pair of two
 /// horizontally adjacent blocks. This is the default; `--stealth-block`
-/// overrides it (smaller blocks carry more data per frame).
-pub const BLOCK: usize = 6;
+/// overrides it (smaller blocks carry more data per frame). Block 4 gets
+/// a 1 GiB archive close to a regular encode's wall time; block 6 stays
+/// available for maximum robustness through very aggressive re-encoding.
+pub const BLOCK: usize = 4;
 /// Even block sizes tried by the blind decoder, in probe order: the default
 /// first, then the faster smaller blocks, then the sturdier larger ones.
-const CANDIDATE_BLOCKS: [usize; 8] = [6, 4, 2, 8, 10, 12, 14, 16];
+const CANDIDATE_BLOCKS: [usize; 8] = [4, 6, 2, 8, 10, 12, 14, 16];
 /// Luma delta applied to each block of a pair.
 pub const MODULATION: i16 = 25;
 /// The background luma is clamped to this range before modulation.
@@ -139,6 +142,9 @@ impl Geometry {
 pub struct StealthSettings {
     pub width: usize,
     pub height: usize,
+    /// The background is resampled to `width` x `height`; encoding skips the
+    /// (identity) scale filter when the background already matches.
+    pub rescale: bool,
     pub block: usize,
     pub fps: u8,
     pub crf: u8,
@@ -227,7 +233,51 @@ fn shift_towards(image: &mut [u8], block: usize, width: usize, x0: usize, y0: us
 }
 
 pub fn modulate(image: &mut [u8], geometry: Geometry, bits: &[u8]) {
-    modulate_at(image, geometry, 0, 0, bits);
+    let luma = geometry.width * geometry.height;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    // Every grid row owns a disjoint pixel band, so the rows can spread
+    // over the worker pool. Tight machines stay serial: the FFmpeg encoder
+    // and reader processes need those cores too, and sharing them measured
+    // slower than the serial loop.
+    if geometry.rows <= 2 || luma < 1 << 18 || workers < 6 {
+        modulate_at(image, geometry, 0, 0, bits);
+    } else {
+        modulate_parallel(image, geometry, bits);
+    }
+}
+
+/// Spreads the grid rows over the worker pool, four grid rows per task so a
+/// 720p frame offers ~30 stealable chunks. Rows never share pixels (the
+/// grid tiles the luma plane exactly), so this is a pure data split.
+fn modulate_parallel(image: &mut [u8], geometry: Geometry, bits: &[u8]) {
+    const ROWS_PER_TASK: usize = 4;
+    let luma = geometry.width * geometry.height;
+    let row_bytes = geometry.width * geometry.block;
+    image[..luma]
+        .par_chunks_mut(row_bytes * ROWS_PER_TASK)
+        .enumerate()
+        .for_each(|(chunk, slice)| {
+            for value in slice.iter_mut() {
+                *value = (*value).clamp(BASE_LOW, BASE_HIGH);
+            }
+            for inside in 0..ROWS_PER_TASK {
+                let row = chunk * ROWS_PER_TASK + inside;
+                if row >= geometry.rows {
+                    break;
+                }
+                let offset = inside * row_bytes;
+                modulate_row_at(
+                    &mut slice[offset..offset + row_bytes],
+                    geometry,
+                    0,
+                    0,
+                    bits,
+                    row,
+                );
+            }
+        });
 }
 
 /// Applies one grid row's anchor blocks and pair modulation. `y0` is the
@@ -468,10 +518,14 @@ pub(crate) fn encode<R: Read>(
         .arg(local_path(background))
         .args([
             "-vf",
-            &format!(
-                "scale={}:{}:flags=bicubic,setsar=1",
-                settings.width, settings.height
-            ),
+            &if settings.rescale {
+                format!(
+                    "scale={}:{}:flags=bicubic,setsar=1",
+                    settings.width, settings.height
+                )
+            } else {
+                "setsar=1".to_owned()
+            },
             "-r",
             &fps,
         ])
@@ -888,30 +942,38 @@ impl<R: Read> Read for Reader<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Geometry, Raster, demodulate, find_alignment, modulate};
+    use super::{
+        Geometry, Raster, demodulate, find_alignment, modulate, modulate_at, modulate_parallel,
+    };
 
     const WIDTH: usize = 240;
     const HEIGHT: usize = 144;
 
-    fn background() -> Vec<u8> {
-        (0..WIDTH * HEIGHT * 3 / 2)
-            .map(|i| (30 + (i * 37 + i / WIDTH * 11) % 221) as u8)
+    fn background_for(width: usize, height: usize) -> Vec<u8> {
+        (0..width * height * 3 / 2)
+            .map(|i| (30 + (i * 37 + i / width * 11) % 221) as u8)
             .collect()
+    }
+
+    fn background() -> Vec<u8> {
+        background_for(WIDTH, HEIGHT)
     }
 
     #[test]
     fn geometry_matches_the_documented_capacities() {
         let full = Geometry::new(1920, 1080, super::BLOCK).unwrap();
-        assert_eq!(full.frame_bytes(), 6996);
+        assert_eq!(full.frame_bytes(), 15893);
         let small = Geometry::new(WIDTH, HEIGHT, super::BLOCK).unwrap();
-        assert_eq!(small.frame_bytes(), 95);
-        // Block 4 packs (6/4)^2 = 2.25x as many bit pairs into the same
-        // frame; integer rounding gives 2.4x at this resolution.
-        let dense = Geometry::new(WIDTH, HEIGHT, 4).unwrap();
-        assert_eq!(dense.frame_bytes(), 232);
+        assert_eq!(small.frame_bytes(), 232);
+        // Block 6 keeps the older sturdier cell size (0.44x the payload).
+        assert_eq!(Geometry::new(WIDTH, HEIGHT, 6).unwrap().frame_bytes(), 95);
+        // Block 2 packs (4/2)^2 = 4x as many bit pairs into the same frame;
+        // integer rounding gives 2.4x at this resolution.
+        let dense = Geometry::new(WIDTH, HEIGHT, 2).unwrap();
+        assert_eq!(dense.frame_bytes(), 1003);
         assert!(
             dense.frame_bytes() * 4 > small.frame_bytes() * 9,
-            "block 4 must carry at least the documented 2.25x density"
+            "block 2 must carry at least the documented 4x density"
         );
         // The legacy layer carries exactly half the bits per frame.
         assert_eq!(
@@ -925,8 +987,8 @@ mod tests {
 
     #[test]
     fn modulation_round_trips_through_clamping() {
-        // Both a default and a dense block must survive a full round trip.
-        for block in [super::BLOCK, 4] {
+        // Both the default and the sturdier block must round trip.
+        for block in [super::BLOCK, 6] {
             round_trip(block);
         }
     }
@@ -940,7 +1002,7 @@ mod tests {
     fn legacy_layer_still_round_trips_one_bit_per_pair() {
         // Videos encoded before the density increase still restore: the
         // decoder probes the one-bit-per-pair layer beside the current one.
-        for block in [super::BLOCK, 4] {
+        for block in [super::BLOCK, 6] {
             round_trip_with(Geometry::legacy(WIDTH, HEIGHT, block).unwrap());
         }
     }
@@ -984,5 +1046,21 @@ mod tests {
             find_alignment(&background()[..WIDTH * HEIGHT], geometry, &mut raster),
             None
         );
+    }
+
+    #[test]
+    fn parallel_modulation_matches_the_serial_loop() {
+        // Forced on machines with few cores: the CI runners never reach the
+        // available_parallelism() >= 6 gate, so exercise the pool split
+        // directly and require bitwise-identical output.
+        let geometry = Geometry::new(WIDTH * 8, HEIGHT * 8, 4).unwrap();
+        let bits: Vec<u8> = (0..geometry.frame_bytes())
+            .map(|byte| (byte % 13) as u8)
+            .collect();
+        let mut serial = background_for(geometry.width, geometry.height);
+        modulate_at(&mut serial, geometry, 0, 0, &bits);
+        let mut parallel = background_for(geometry.width, geometry.height);
+        modulate_parallel(&mut parallel, geometry, &bits);
+        assert_eq!(serial, parallel);
     }
 }

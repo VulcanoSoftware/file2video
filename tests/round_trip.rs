@@ -481,18 +481,19 @@ fn stealth_round_trip_with_looping_background_audio() {
     ));
     assert_eq!(fs::read(dir.join("restored.bin")).unwrap(), data);
 
-    // A denser block encodes far fewer frames for the same payload, and the
+    // The default block is the denser speed lever: a milder explicit
+    // --stealth-block 6 needs far more frames for the same payload, and the
     // blind decoder detects the block size automatically: no flag on decode.
-    let dense = cli(
+    let chunky = cli(
         dir,
         &[
             "encode",
             "payload.bin",
-            "stealth-block4.mp4",
+            "stealth-block6.mp4",
             "--stealth",
             "dummy.mp4",
             "--stealth-block",
-            "4",
+            "6",
             "--fps",
             "10",
             "--preset",
@@ -503,11 +504,11 @@ fn stealth_round_trip_with_looping_background_audio() {
             "1000",
         ],
     );
-    success(dense.clone());
-    let dense_stderr = String::from_utf8_lossy(&dense.stderr);
+    success(chunky.clone());
+    let chunky_stderr = String::from_utf8_lossy(&chunky.stderr);
     assert!(
-        dense_stderr.contains("block 4"),
-        "expected the block size in the message, got: {dense_stderr}"
+        chunky_stderr.contains("block 6"),
+        "expected the block size in the message, got: {chunky_stderr}"
     );
     let frames = |file: &str| {
         let probe = Command::new("ffprobe")
@@ -529,20 +530,20 @@ fn stealth_round_trip_with_looping_background_audio() {
             .unwrap()
     };
     assert!(
-        frames("stealth-block4.mp4") * 2 < frames("stealth.mp4"),
-        "block 4 must use well under half the frames of the default block 6"
+        frames("stealth.mp4") * 2 < frames("stealth-block6.mp4"),
+        "the default block 4 must use well under half the frames of block 6"
     );
     success(cli(
         dir,
         &[
             "decode",
-            "stealth-block4.mp4",
-            "restored-block4.bin",
+            "stealth-block6.mp4",
+            "restored-block6.bin",
             "--password",
             "a",
         ],
     ));
-    assert_eq!(fs::read(dir.join("restored-block4.bin")).unwrap(), data);
+    assert_eq!(fs::read(dir.join("restored-block6.bin")).unwrap(), data);
 
     // An odd block size is rejected up front.
     let odd = cli(
