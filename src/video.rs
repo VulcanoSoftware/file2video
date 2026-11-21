@@ -176,6 +176,20 @@ impl Gpu {
         self != Self::Vaapi
     }
 
+    /// Human-readable summary of the exact quality mode the backend's
+    /// encoder runs at, mirroring [`Gpu::quality_args`]; used for progress
+    /// logging so the chosen heuristics are visible in the terminal.
+    pub(crate) fn mode_label(self, crf: u8, preset: &str) -> String {
+        match self {
+            Self::Amf => format!("AMF quality mode {}, CQP qp {crf}", amf_quality(preset)),
+            Self::Nvenc => format!("NVENC preset {}, VBR cq {crf}", nvenc_preset(preset)),
+            Self::Qsv => format!("QSV preset {preset}, global quality {crf}"),
+            Self::Vaapi => format!("VAAPI CQP qp {crf}"),
+            Self::VideoToolbox => format!("VideoToolbox q {}", vt_quality(crf)),
+            Self::Auto | Self::Off => unreachable!(),
+        }
+    }
+
     pub(crate) fn quality_args(self, crf: u8, preset: &str) -> Vec<String> {
         let mut args = Vec::new();
         match self {
@@ -307,7 +321,7 @@ impl Tools {
         } else {
             settings.crf
         };
-        let encoder = self.select_encoder(crf)?;
+        let encoder = self.select_encoder(crf, &settings.preset)?;
         let mut cmd = self.command();
         if let Encoder::Gpu(backend) = encoder {
             for arg in backend.device_args() {
@@ -441,8 +455,9 @@ impl Tools {
         }
     }
 
-    pub(crate) fn select_encoder(&self, crf: u8) -> Result<Encoder> {
+    pub(crate) fn select_encoder(&self, crf: u8, preset: &str) -> Result<Encoder> {
         if self.gpu == Gpu::Off {
+            eprintln!("Encoding with libx264 on the CPU (preset {preset}, CRF {crf}).");
             return Ok(Encoder::Cpu);
         }
         let forced = self.gpu != Gpu::Auto && self.gpu != Gpu::Off;
@@ -478,7 +493,10 @@ impl Tools {
             }
             match self.preflight(backend, crf) {
                 Ok(()) => {
-                    eprintln!("Encoding with {name} on the GPU.");
+                    eprintln!(
+                        "Encoding with {name} on the GPU ({}).",
+                        backend.mode_label(crf, preset)
+                    );
                     return Ok(Encoder::Gpu(backend));
                 }
                 Err(reason) if forced => bail!(
@@ -1511,6 +1529,21 @@ mod tests {
         assert_eq!(amf_quality("ultrafast"), "speed");
         assert_eq!(vt_quality(18), 82);
         assert_eq!(vt_quality(0), 100);
+        // The progress log must name the exact mode an encoder runs at so
+        // the quality/speed heuristics stay visible.
+        assert_eq!(
+            Gpu::Amf.mode_label(18, "faster"),
+            "AMF quality mode speed, CQP qp 18"
+        );
+        assert_eq!(
+            Gpu::Nvenc.mode_label(18, "slow"),
+            "NVENC preset p6, VBR cq 18"
+        );
+        assert_eq!(
+            Gpu::Qsv.mode_label(22, "fast"),
+            "QSV preset fast, global quality 22"
+        );
+        assert_eq!(Gpu::Vaapi.mode_label(18, "anything"), "VAAPI CQP qp 18");
     }
 
     #[test]

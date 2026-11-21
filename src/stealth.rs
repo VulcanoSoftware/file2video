@@ -715,7 +715,7 @@ pub(crate) fn encode<R: Read>(
         frame_len(geometry),
     );
 
-    let encoder = tools.select_encoder(settings.crf)?;
+    let encoder = tools.select_encoder(settings.crf, &settings.preset)?;
     let mut cmd = Command::new(&tools.ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         .args([
