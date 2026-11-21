@@ -29,6 +29,12 @@
   .check { display: flex; align-items: center; gap: .5rem; margin: .9rem 0 .25rem; font-size: .9rem; }
   .check input { width: auto; }
   .hint { font-size: .78rem; color: var(--muted); margin-top: .2rem; }
+  .import-wrap { max-width: 1100px; margin: 0 auto 1.5rem; }
+  #import-text { min-height: 130px; }
+  #import-status { margin: .6rem 0 0; font-size: .83rem; line-height: 1.45; }
+  #import-status.ok { color: var(--ok); }
+  #import-status.warn { color: var(--warn); }
+  input[type="file"] { color: var(--muted); font-size: .85rem; }
   textarea {
     width: 100%; min-height: 260px; border-radius: 6px; border: 1px solid var(--border);
     background: var(--bg); color: var(--text); font-family: ui-monospace, "SF Mono", Consolas, monospace;
@@ -48,10 +54,38 @@
   <p class="lead">Build a <code>file2video.conf</code> file for the <code>file2video</code> CLI.
   Drop it in the directory where you run the program (or pass <code>--config &lt;PATH&gt;</code>) and every
   value below becomes a default for <code>encode</code>, <code>decode</code>, <code>estimate</code> and
-  <code>benchmark</code>. Command-line flags always override this file. Encode with
+  <code>benchmark</code>. Command-line flags always override this file. Import an existing
+  <code>file2video.conf</code> below to edit it, or start from scratch. Encode with
   <code>--no-password</code> to skip encryption, or enter a password when asked; everything here is
   optional tuning.</p>
 </header>
+
+<div class="import-wrap">
+  <section class="panel">
+    <h2>Import an existing <code>file2video.conf</code></h2>
+    <p class="hint" style="margin-top:0">Upload your current config file below (or paste its contents) and
+      every recognised setting is loaded into the form so you can edit it. Unknown keys and calibration
+      files are ignored; malformed lines are reported instead of silently dropped.</p>
+    <div class="row">
+      <div>
+        <label for="import-file"><b>Import from a config file</b></label>
+        <input type="file" id="import-file" accept=".conf,.txt,text/plain">
+      </div>
+      <div>
+        <label for="import-text"><b>… or paste the config text</b></label>
+        <textarea id="import-text" spellcheck="false" placeholder="# file2video.conf
+optimise = balanced
+fps = 30
+# chroma = on"></textarea>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="import">Import into the form</button>
+      <button id="import-clear" class="secondary">Clear the form</button>
+    </div>
+    <p id="import-status"></p>
+  </section>
+</div>
 
 <div class="layout">
   <section class="panel">
@@ -260,6 +294,116 @@
     link.download = "file2video.conf";
     link.click();
     URL.revokeObjectURL(url);
+  });
+
+  // ---- Import ----------------------------------------------------------------
+  // Checkboxes are emitted as bare `on` values when checked and omitted when
+  // not, and selects encode the defaults as `auto`/`off` vs an empty value.
+  const CHECKBOX_FIELDS = ["chroma", "intra", "stealth_dense"];
+  const SELECT_ALIASES = {
+    gpu: { auto: "", off: "off", amf: "amf", nvenc: "nvenc", qsv: "qsv", vaapi: "vaapi", "video-toolbox": "video-toolbox" },
+    optimise: { off: "", smallest: "smallest", fastest: "fastest", balanced: "balanced" },
+    compress: { light: "light", medium: "medium", high: "high" },
+  };
+  const FREE_FIELDS = new Set(["width", "height", "block_size", "fps", "crf", "ecc_symbols",
+    "pbkdf2_iterations", "threads", "stealth_intensity", "stealth_block", "preset"]);
+  const TRUTHY = new Set(["on", "yes", "true", "1"]);
+
+  function importConfig(text) {
+    let imported = 0;
+    const unknown = [];
+    const problems = [];
+    const seen = new Set();
+    text.split(/\r?\n/).forEach((raw) => {
+      // Mirror config.rs: '#' or ';' opens a comment anywhere in the line,
+      // keys are case-insensitive, and `key = value` needs the '='.
+      const line = raw.split(/[#;]/)[0].trim();
+      if (!line) return;
+      const eq = line.indexOf("=");
+      if (eq < 0) {
+        problems.push("line without '=': " + line);
+        return;
+      }
+      const key = line.slice(0, eq).trim().toLowerCase();
+      const value = line.slice(eq + 1).trim();
+      if (!value) return;
+      if (SELECT_ALIASES[key]) {
+        const mapped = SELECT_ALIASES[key][value.toLowerCase()];
+        if (mapped === undefined) {
+          problems.push(key + " = " + value);
+        } else {
+          el(key).value = mapped;
+          imported++;
+        }
+      } else if (CHECKBOX_FIELDS.includes(key)) {
+        const parsed = TRUTHY.has(value.toLowerCase());
+        if (!parsed && !new Set(["off", "no", "false", "0"]).has(value.toLowerCase())) {
+          problems.push(key + " = " + value);
+        } else {
+          el(key).checked = parsed;
+          imported++;
+        }
+      } else if (FREE_FIELDS.has(key)) {
+        if (key === "preset") {
+          const presets = Array.from(el("preset").options).map((option) => option.value || option.text);
+          if (!presets.includes(value)) {
+            problems.push("preset = " + value);
+            return;
+          }
+        } else if (Number.isNaN(Number(value))) {
+          problems.push(key + " = " + value);
+          return;
+        }
+        el(key).value = value;
+        imported++;
+      } else if (!unknown.includes(key)) {
+        unknown.push(key);
+      }
+      seen.add(key);
+    });
+    render();
+    const status = el("import-status");
+    const parts = [];
+    parts.push(imported === 1 ? "Imported 1 setting." : "Imported " + imported + " settings.");
+    if (unknown.length) {
+      parts.push("Unknown keys ignored: " + unknown.join(", ") + ".");
+    }
+    if (problems.length) {
+      parts.push("Values that do not match the form (left out): " + problems.join(", ") + ".");
+    }
+    status.textContent = parts.join(" ");
+    status.className = imported ? "ok" : "warn";
+    if (problems.length || unknown.length) status.className = "warn";
+  }
+
+  el("import-file").addEventListener("change", () => {
+    const file = el("import-file").files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      el("import-text").value = String(reader.result);
+      importConfig(el("import-text").value);
+    };
+    reader.readAsText(file);
+  });
+
+  el("import").addEventListener("click", () => {
+    importConfig(el("import-text").value);
+  });
+
+  el("import-clear").addEventListener("click", () => {
+    FIELDS.forEach((field) => {
+      const node = el(field);
+      if (node.type === "checkbox") {
+        node.checked = false;
+      } else {
+        node.value = "";
+      }
+    });
+    const status = el("import-status");
+    status.textContent = "Form cleared.";
+    status.className = "ok";
+    render();
   });
 
   render();
