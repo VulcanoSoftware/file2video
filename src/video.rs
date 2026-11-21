@@ -88,32 +88,69 @@ impl Gpu {
         }
     }
 
-    // On hybrid-laptop GPUs (an integrated GPU plus a discrete one) the
-    // discrete GPU is usually much faster, so put its vendor's backend first
-    // when the OS reports such a card.
-    pub fn prioritized_candidates(gpus: &[String]) -> Vec<Self> {
-        let mut candidates = Self::candidates().to_vec();
-        let discrete = gpus.iter().find_map(|name| {
-            let lower = name.to_ascii_lowercase();
-            if lower.contains("nvidia") || lower.contains("geforce") {
-                Some(Self::Nvenc)
-            } else if lower.contains("intel") && lower.contains("arc") {
-                Some(Self::Qsv)
-            } else if (lower.contains("radeon") || lower.contains("amd")) && lower.contains("rx") {
-                Some(Self::Amf)
+    /// Weights a reported GPU name by the hardware encoder backend it
+    /// implies. Discrete cards outweigh integrated graphics; virtual
+    /// adapters produce no signal at all because no backend can use them.
+    /// Returns the backend and its weight (discrete 8, integrated 4).
+    fn backend_signal(name: &str) -> Option<(Self, u32)> {
+        if crate::diag::is_virtual_gpu(name) {
+            return None;
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro") {
+            return Some((Self::Nvenc, 8));
+        }
+        if lower.contains("radeon") || lower.contains("ati ") || lower.contains("amd") {
+            let discrete = lower.contains("rx") || lower.contains("pro") || lower.contains("fury");
+            let weight = if discrete { 8 } else { 4 };
+            return if cfg!(windows) {
+                Some((Self::Amf, weight))
+            } else if cfg!(target_os = "linux") {
+                Some((Self::Vaapi, weight))
             } else {
                 None
-            }
-        });
-        if let Some(index) = discrete.and_then(|preferred| {
-            candidates
-                .iter()
-                .position(|candidate| *candidate == preferred)
-        }) {
-            let preferred = candidates.remove(index);
-            candidates.insert(0, preferred);
+            };
         }
-        candidates
+        if lower.contains("intel") || lower.contains("iris") || lower.contains("uhd") {
+            let weight = if lower.contains("arc") { 8 } else { 4 };
+            return if cfg!(target_os = "macos") {
+                None
+            } else if cfg!(target_os = "linux") {
+                Some((Self::Vaapi, weight))
+            } else {
+                Some((Self::Qsv, weight))
+            };
+        }
+        None
+    }
+
+    // Ranks the backends by the GPUs the OS reported: with several GPUs the
+    // fastest (discrete before integrated) is tried first, and adapters
+    // that cannot encode (virtual displays, hypervisor graphics) are
+    // ignored entirely. Backends without a signal keep the platform order.
+    pub fn prioritized_candidates(gpus: &[String]) -> Vec<Self> {
+        let mut weights: Vec<(Self, u32)> = Vec::new();
+        for name in gpus {
+            if let Some((backend, weight)) = Self::backend_signal(name) {
+                match weights.iter_mut().find(|(known, _)| *known == backend) {
+                    Some((_, known)) => *known = (*known).max(weight),
+                    None => weights.push((backend, weight)),
+                }
+            }
+        }
+        weights.sort_by_key(|(_, weight)| std::cmp::Reverse(*weight));
+        let mut candidates = Self::candidates().to_vec();
+        let mut ordered = Vec::with_capacity(candidates.len());
+        for (backend, _) in weights {
+            if let Some(index) = candidates
+                .iter()
+                .position(|candidate| *candidate == backend)
+            {
+                ordered.push(candidates.remove(index));
+            }
+        }
+        ordered.extend(candidates);
+        ordered
     }
 
     pub(crate) fn device_args(self) -> Vec<String> {
@@ -417,7 +454,8 @@ impl Tools {
             let ordered = Gpu::prioritized_candidates(&gpus);
             if ordered.first() != Gpu::candidates().first() && ordered.len() > 1 {
                 eprintln!(
-                    "Detected a discrete GPU; trying {} first.",
+                    "Found GPU {}: trying {} first.",
+                    crate::diag::gpu_names().join("; "),
                     ordered[0].encoder_name()
                 );
             }
@@ -1398,16 +1436,60 @@ mod tests {
             "NVIDIA GeForce RTX 4060 Laptop GPU".to_owned(),
         ];
         assert_eq!(Gpu::prioritized_candidates(&hybrid)[0], Gpu::Nvenc);
-        assert_eq!(
-            Gpu::prioritized_candidates(&["Intel(R) Arc(TM) Graphics".to_owned()])[0],
-            Gpu::Qsv
-        );
+        let arc = Gpu::prioritized_candidates(&["Intel(R) Arc(TM) Graphics".to_owned()])[0];
+        if cfg!(target_os = "linux") {
+            assert_eq!(arc, Gpu::Vaapi);
+        } else {
+            assert_eq!(arc, Gpu::Qsv);
+        }
         let integrated = vec!["AMD Radeon(TM) Graphics".to_owned()];
         assert_eq!(
             Gpu::prioritized_candidates(&integrated),
             Gpu::candidates().to_vec()
         );
         assert_eq!(Gpu::prioritized_candidates(&[]), Gpu::candidates().to_vec());
+    }
+
+    #[test]
+    fn virtual_only_adapters_keep_the_default_order() {
+        // A mirrored USB display must never steer the encoder choice.
+        let names = vec!["USB Mobile Monitor Virtual Display (driver 2.0.0.1)".to_owned()];
+        assert_eq!(
+            Gpu::prioritized_candidates(&names),
+            Gpu::candidates().to_vec()
+        );
+    }
+
+    #[test]
+    fn the_real_igpu_is_picked_beside_a_virtual_display() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        // The reported machine: a mirrored display plus an AMD 760M iGPU.
+        let mixed = vec![
+            "USB Mobile Monitor Virtual Display (driver 2.0.0.1)".to_owned(),
+            "AMD Radeon (TM) Graphics (driver 32.0.31033.3)".to_owned(),
+        ];
+        let first = Gpu::prioritized_candidates(&mixed)[0];
+        if cfg!(windows) {
+            assert_eq!(first, Gpu::Amf);
+        } else {
+            assert_eq!(first, Gpu::Vaapi);
+        }
+    }
+
+    #[test]
+    fn integrated_graphics_prefer_the_vendor_backend() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let intel = vec!["Intel(R) UHD Graphics 770".to_owned()];
+        let first = Gpu::prioritized_candidates(&intel)[0];
+        if cfg!(target_os = "linux") {
+            assert_eq!(first, Gpu::Vaapi);
+        } else {
+            assert_eq!(first, Gpu::Qsv);
+        }
     }
 
     #[test]

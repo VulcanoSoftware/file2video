@@ -113,10 +113,6 @@ impl Geometry {
         })
     }
 
-    pub fn bits_per_frame(&self) -> usize {
-        self.bits
-    }
-
     pub fn frame_bytes(&self) -> usize {
         self.bits / 8
     }
@@ -188,71 +184,25 @@ fn level_step(area: i64) -> i64 {
 /// recovers the symbol from the block-mean difference. Quaternary layers
 /// carry two bits per pair across four luma levels; legacy layers one bit.
 /// Data blocks past the end of `bits` keep the clamped background.
-pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, bits: &[bool]) {
+/// Bit `index` of a big-endian byte-aligned bitstream.
+fn fetch_bit(bits: &[u8], index: usize) -> bool {
+    bits[index / 8] >> (7 - index % 8) & 1 == 1
+}
+
+/// `symbol_bits`-bit symbol `index` of a big-endian byte-aligned bitstream.
+fn fetch_symbol(bits: &[u8], index: usize, symbol_bits: usize) -> u8 {
+    debug_assert_eq!(symbol_bits, 2);
+    let offset = index * symbol_bits;
+    (bits[offset / 8] >> (8 - offset % 8 - symbol_bits)) & 3
+}
+
+pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, bits: &[u8]) {
     let width = geometry.width;
     for value in &mut image[..width * geometry.height] {
         *value = (*value).clamp(BASE_LOW, BASE_HIGH);
     }
-    let block = geometry.block;
     for row in 0..geometry.rows {
-        for col in 0..geometry.columns {
-            if geometry.is_anchor(col, row) {
-                fill_block(
-                    image,
-                    block,
-                    width,
-                    col * block + dx,
-                    row * block + dy,
-                    anchor_value(col, row),
-                );
-            }
-        }
-    }
-    let area = (block * block) as i64;
-    let step = area * i64::from(MODULATION);
-    let level = level_step(area);
-    let symbols = bits.len() / geometry.symbol_bits;
-    for row in 0..geometry.rows {
-        for pair in 0..geometry.pairs {
-            let index = row * geometry.pairs + pair;
-            if index >= symbols {
-                continue;
-            }
-            let col = ANCHOR_COLS + 2 * pair;
-            let x0 = col * block + dx;
-            let x1 = (col + 1) * block + dx;
-            let y0 = row * block + dy;
-            let sum_a = i64::try_from(block_sum(image, block, width, x0, y0)).unwrap_or(0);
-            let sum_b = i64::try_from(block_sum(image, block, width, x1, y0)).unwrap_or(0);
-            let middle = (sum_a + sum_b) / 2;
-            let (target_a, target_b) = if geometry.symbol_bits == 1 {
-                if bits[index] {
-                    (middle + step, middle - step)
-                } else {
-                    (middle - step, middle + step)
-                }
-            } else {
-                let symbol = u64::from(bits[2 * index]) * 2 + u64::from(bits[2 * index + 1]);
-                let delta = (2 * symbol as i64 - 3) * level / 2;
-                (middle + delta, middle - delta)
-            };
-            shift_towards(
-                image,
-                block,
-                width,
-                x0,
-                y0,
-                i32::try_from((target_a - sum_a) / area).unwrap_or(0),
-            );
-            shift_towards(
-                image,
-                block,
-                width,
-                x1,
-                y0,
-                i32::try_from((target_b - sum_b) / area).unwrap_or(0),
-            );
-        }
+        modulate_row_at(image, geometry, dx, row * geometry.block + dy, bits, row);
     }
 }
 
@@ -276,8 +226,79 @@ fn shift_towards(image: &mut [u8], block: usize, width: usize, x0: usize, y0: us
     }
 }
 
-pub fn modulate(image: &mut [u8], geometry: Geometry, bits: &[bool]) {
+pub fn modulate(image: &mut [u8], geometry: Geometry, bits: &[u8]) {
     modulate_at(image, geometry, 0, 0, bits);
+}
+
+/// Applies one grid row's anchor blocks and pair modulation. `y0` is the
+/// row's top edge: `dy`-shifted in the offset-aware serial path, band-local
+/// zero in the parallel path where every grid row owns a disjoint pixel
+/// band.
+fn modulate_row_at(
+    image: &mut [u8],
+    geometry: Geometry,
+    dx: usize,
+    y0: usize,
+    bits: &[u8],
+    row: usize,
+) {
+    let width = geometry.width;
+    let block = geometry.block;
+    for col in 0..geometry.columns {
+        if geometry.is_anchor(col, row) {
+            fill_block(
+                image,
+                block,
+                width,
+                col * block + dx,
+                y0,
+                anchor_value(col, row),
+            );
+        }
+    }
+    let area = (block * block) as i64;
+    let step = area * i64::from(MODULATION);
+    let level = level_step(area);
+    let symbols = bits.len() * 8 / geometry.symbol_bits;
+    for pair in 0..geometry.pairs {
+        let index = row * geometry.pairs + pair;
+        if index >= symbols {
+            continue;
+        }
+        let col = ANCHOR_COLS + 2 * pair;
+        let x0 = col * block + dx;
+        let x1 = (col + 1) * block + dx;
+        let sum_a = i64::try_from(block_sum(image, block, width, x0, y0)).unwrap_or(0);
+        let sum_b = i64::try_from(block_sum(image, block, width, x1, y0)).unwrap_or(0);
+        let middle = (sum_a + sum_b) / 2;
+        let (target_a, target_b) = if geometry.symbol_bits == 1 {
+            if fetch_bit(bits, index) {
+                (middle + step, middle - step)
+            } else {
+                (middle - step, middle + step)
+            }
+        } else {
+            let symbol = fetch_symbol(bits, index, geometry.symbol_bits);
+            let delta = (2 * symbol as i64 - 3) * level / 2;
+            (middle + delta, middle - delta)
+        };
+        shift_towards(
+            image,
+            block,
+            width,
+            x0,
+            y0,
+            i32::try_from((target_a - sum_a) / area).unwrap_or(0),
+        );
+        shift_towards(
+            image,
+            block,
+            width,
+            x1,
+            y0,
+            i32::try_from((target_b - sum_b) / area).unwrap_or(0),
+        );
+    }
 }
 
 /// A reusable running-sum (integral image) scratch buffer that averages any
@@ -459,11 +480,14 @@ pub(crate) fn encode<R: Read>(
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
     let mut bg_process = tools.spawn(read_cmd)?;
-    let bg_pipe = bg_process
-        .child
-        .stdout
-        .take()
-        .context("missing FFmpeg stdout")?;
+    let bg_frames = BgFrames::start(
+        bg_process
+            .child
+            .stdout
+            .take()
+            .context("missing FFmpeg stdout")?,
+        frame_len(geometry),
+    );
 
     let encoder = tools.select_encoder(settings.crf)?;
     let mut cmd = Command::new(&tools.ffmpeg);
@@ -522,10 +546,10 @@ pub(crate) fn encode<R: Read>(
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
     let mut writer = Writer {
         pipe,
-        bg_pipe,
+        bg_frames,
         geometry,
         image: vec![0; frame_len(geometry)],
-        bits: Vec::with_capacity(geometry.bits_per_frame()),
+        pending: Vec::with_capacity(frame_len(geometry)),
         progress: Progress::new("Encode", frames),
         sent: 0,
         bytes: 0,
@@ -555,12 +579,70 @@ pub(crate) fn encode<R: Read>(
     Ok(tmp)
 }
 
+/// Prefetches background frames on a dedicated worker thread so the raw
+/// FFmpeg pipe keeps being drained while the current frame is modulated and
+/// encoded. The worker owns the child's stdout; dropping the receiver (and
+/// then the pipe with it) makes FFmpeg exit with a broken pipe.
+struct BgFrames {
+    frames: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    len: usize,
+}
+
+impl BgFrames {
+    fn start(pipe: ChildStdout, frame_len: usize) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let worker = std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut frame = vec![0; frame_len];
+            loop {
+                if pipe.read_exact(&mut frame).is_err() || sender.send(frame.clone()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            frames: Some(receiver),
+            worker: Some(worker),
+            len: frame_len,
+        }
+    }
+
+    /// The next background frame, or an error once the background reader
+    /// stopped (end of stream or FFmpeg failure).
+    fn load(&mut self, image: &mut [u8]) -> Result<()> {
+        let frame = self
+            .frames
+            .as_ref()
+            .and_then(|frames| frames.recv().ok())
+            .ok_or_else(|| anyhow::anyhow!("the stealth background video ended"))?;
+        ensure!(frame.len() == self.len, "unexpected background frame size");
+        image.copy_from_slice(&frame);
+        Ok(())
+    }
+}
+
+impl Drop for BgFrames {
+    fn drop(&mut self) {
+        // Dropping the receiver first unblocks a worker waiting on `send`;
+        // joining afterwards can only wait for a pending pipes read at worst.
+        if let Some(worker) = self.worker.take() {
+            drop(self.frames.take());
+            let _ = worker.join();
+        }
+    }
+}
+
 struct Writer {
     pipe: ChildStdin,
-    bg_pipe: ChildStdout,
+    bg_frames: BgFrames,
     geometry: Geometry,
     image: Vec<u8>,
-    bits: Vec<bool>,
+    /// Bytes waiting for a free frame; every full `frame_bytes` chunk
+    /// becomes one frame. Frame bit counts are multiples of eight, so frame
+    /// boundaries sit on byte boundaries and no bit-level bookkeeping is
+    /// needed while the payload arrives in byte chunks.
+    pending: Vec<u8>,
     progress: Progress,
     sent: u64,
     bytes: u64,
@@ -568,45 +650,43 @@ struct Writer {
 
 impl Writer {
     fn push(&mut self, data: &[u8]) -> Result<()> {
-        for &byte in data {
-            for shift in (0..8).rev() {
-                self.bit(byte >> shift & 1 == 1)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn bit(&mut self, one: bool) -> Result<()> {
-        if self.bits.is_empty() {
-            self.bg_pipe.read_exact(&mut self.image).map_err(|error| {
-                anyhow::anyhow!("could not read the stealth background video: {error}")
-            })?;
-        }
-        self.bits.push(one);
-        if self.bits.len() == self.geometry.bits_per_frame() {
+        self.pending.extend_from_slice(data);
+        let frame_bytes = self.geometry.frame_bytes();
+        while self.pending.len() >= frame_bytes {
             self.emit_frame()?;
         }
         Ok(())
     }
 
-    /// Modulates the assembled frame onto the background image and writes
-    /// it to the encoder.
+    /// Modulates the next frame's worth of pending bytes onto the
+    /// background image and writes it to the encoder.
     fn emit_frame(&mut self) -> Result<()> {
-        modulate(&mut self.image, self.geometry, &self.bits);
+        self.bg_frames.load(&mut self.image)?;
+        // The very last frame may carry fewer bits: missing bits keep the
+        // clamped background, and rogue decoder output is caught by the
+        // strict stream length plus Reed-Solomon parity.
+        let frame_bytes = self.geometry.frame_bytes();
+        let used = frame_bytes.min(self.pending.len());
+        {
+            let bits = &self.pending[..used];
+            let image = self.image.as_mut_slice();
+            let geometry = self.geometry;
+            modulate(image, geometry, bits);
+        }
         self.pipe
             .write_all(&self.image)
             .context("could not send a modulated frame to FFmpeg")?;
-        self.bytes += self.bits.len() as u64 / 8 + u64::from(!self.bits.len().is_multiple_of(8));
+        self.pending.drain(..used);
+        self.bytes += used as u64;
         self.sent += 1;
         self.progress.update(self.sent, self.bytes);
-        self.bits.clear();
         Ok(())
     }
 
     /// Consumes the writer so the encoder's stdin is closed and FFmpeg
     /// finalises the file, and returns the number of frames written.
     fn finish(mut self) -> Result<u64> {
-        if !self.bits.is_empty() {
+        if !self.pending.is_empty() {
             self.emit_frame()?;
         }
         Ok(self.sent)
@@ -830,7 +910,7 @@ mod tests {
         let dense = Geometry::new(WIDTH, HEIGHT, 4).unwrap();
         assert_eq!(dense.frame_bytes(), 232);
         assert!(
-            dense.bits_per_frame() * 4 > small.bits_per_frame() * 9,
+            dense.frame_bytes() * 4 > small.frame_bytes() * 9,
             "block 4 must carry at least the documented 2.25x density"
         );
         // The legacy layer carries exactly half the bits per frame.
@@ -866,8 +946,8 @@ mod tests {
     }
 
     fn round_trip_with(geometry: Geometry) {
-        let bits: Vec<bool> = (0..geometry.frame_bytes() * 8)
-            .map(|i| (i % 7) % 2 == 0)
+        let bits: Vec<u8> = (0..geometry.frame_bytes())
+            .map(|byte| (byte % 7) as u8)
             .collect();
         let mut image = background();
         modulate(&mut image, geometry, &bits);
@@ -877,7 +957,8 @@ mod tests {
         raster.scan(&image[..WIDTH * HEIGHT], WIDTH, HEIGHT);
         let mut out = vec![0; geometry.frame_bytes()];
         demodulate(geometry, alignment.unwrap(), &raster, &mut out);
-        for (index, &bit) in bits.iter().enumerate() {
+        for index in 0..geometry.frame_bytes() * 8 {
+            let bit = bits[index / 8] >> (7 - index % 8) & 1 == 1;
             assert_eq!(
                 out[index / 8] >> (7 - index % 8) & 1 == 1,
                 bit,
