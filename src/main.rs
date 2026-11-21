@@ -107,6 +107,10 @@ enum Operation {
         /// --stealth-intensity (40+) for aggressive distribution channels.
         #[arg(long)]
         stealth_dense: bool,
+        /// Leave the looping background's audio out of the output instead of
+        /// muxing it as AAC (default: keep it in sync with the video).
+        #[arg(long)]
+        stealth_no_audio: bool,
     },
     /// Recover and authenticate an original file from an MP4 video.
     Decode {
@@ -586,9 +590,14 @@ fn encode_stealth(
     stealth_block: Option<u16>,
     stealth_intensity: Option<u16>,
     stealth_dense: bool,
+    stealth_no_audio: bool,
     options: Encoding,
     ctx: &Ctx,
 ) -> Result<u64> {
+    // The looping background's audio is muxed into the output by default so
+    // the stealth video looks (and sounds) like the original footage; an
+    // explicit flag or config default drops it and saves the AAC bitrate.
+    let keep_audio = !(stealth_no_audio || ctx.config.stealth_no_audio == Some(true));
     let block = usize::from(
         stealth_block
             .or_else(|| ctx.config.stealth_block.map(|block| block as u16))
@@ -686,12 +695,17 @@ fn encode_stealth(
         .div_ceil(u64::try_from(geometry.frame_bytes()).context("frame capacity overflow")?);
     if !ctx.quiet {
         eprintln!(
-            "Encoding {size} bytes as a stealth layer over {} at {}x{}, block {block}{} at intensity {intensity}, {} fps, CRF {crf}, {parity} parity symbols; writing {frames} frames.",
+            "Encoding {size} bytes as a stealth layer over {} at {}x{}, block {block}{} at intensity {intensity}, {} fps, CRF {crf}, {parity} parity symbols{}; writing {frames} frames.",
             background.display(),
             width,
             height,
             if symbol_bits == 4 { ", dense" } else { "" },
-            fps
+            fps,
+            if keep_audio {
+                ", keeping the background audio"
+            } else {
+                ", without background audio"
+            }
         );
         // The data layer hides near-random noise, so the MP4 runs at a
         // multiple of the payload; the level spacing decides how much
@@ -699,6 +713,16 @@ fn encode_stealth(
         // spacing of ~3.3 luma levels (dense, intensity 25) restores up to
         // about CRF 17 and ~6.7 levels up to about CRF 20; each doubling of
         // the spacing buys roughly 3.5 CRF more.
+        // Blocks under 4 px carry four times the data per frame, but the
+        // H.264 deblocking filter smooths the 2 px pattern away: measured
+        // round trips at 720p failed even at CRF 12 with all-intra, and only
+        // a near-lossless CRF 6 kept the layer readable. Warn before someone
+        // encodes a full archive into a video nobody can restore.
+        if block < 4 {
+            eprintln!(
+                "Warning: --stealth-block {block} rarely survives a real encode; the H.264 deblocking filter erases the 2 px pattern unless the encode is near lossless (--crf 6 --intra --stealth-intensity 50). Prefer the default block 4."
+            );
+        }
         let step_luma = 2.0 * f64::from(intensity) / ((1usize << symbol_bits) - 1) as f64;
         let safe_crf = (17.0 + 3.5 * (step_luma / 3.33).log2()) as u8;
         if crf > safe_crf {
@@ -728,6 +752,7 @@ fn encode_stealth(
             crf,
             preset,
             intra,
+            audio: keep_audio,
             parity,
         },
         layout,
@@ -1567,6 +1592,7 @@ fn run() -> Result<()> {
             stealth_block,
             stealth_intensity,
             stealth_dense,
+            stealth_no_audio,
         } => {
             let frames = match stealth {
                 Some(background) => encode_stealth(
@@ -1579,6 +1605,7 @@ fn run() -> Result<()> {
                     stealth_block,
                     stealth_intensity,
                     stealth_dense,
+                    stealth_no_audio,
                     settings,
                     &ctx,
                 )?,

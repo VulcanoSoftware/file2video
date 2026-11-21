@@ -87,7 +87,7 @@
     bEl("b-chroma").disabled = stealth;
     bEl("b-optimise").disabled = stealth;
     bEl("b-block-size").disabled = stealth;
-    ["b-stealth", "b-stealth-block", "b-stealth-intensity", "b-stealth-dense", "b-bg-file"]
+    ["b-stealth", "b-stealth-block", "b-stealth-intensity", "b-stealth-dense", "b-stealth-no-audio", "b-bg-file"]
       .forEach((id) => { bEl(id).disabled = !stealth; });
     const noPassword = bEl("b-no-password").checked;
     bEl("b-password").disabled = noPassword;
@@ -310,6 +310,14 @@
         addRow("Background loops", Math.ceil((frames / fps) / bgMeta.duration) + "\u00d7 (background is " + fmtTime(bgMeta.duration) + ")");
       }
       if (stealth) {
+        const audioBytes = (frames / fps) * 24000; // AAC 192 kbit/s
+        if (bEl("b-stealth-no-audio").checked) {
+          addRow("Background audio", "dropped with --stealth-no-audio (saved \u2248 " + fmtBytes(audioBytes) + ")");
+        } else {
+          addRow("Background audio", "muxed as AAC 192 kbit/s (\u2248 " + fmtBytes(audioBytes) + ") \u2014 tick --stealth-no-audio to drop it");
+        }
+      }
+      if (stealth) {
         const block = bNum("b-stealth-block") ?? 4;
         addRow("Encode wall-clock guess", "\u2248 " + fmtTime(frames / (275 * 16 / (block * block))) + " on an AMD 760M iGPU at 720p (\u2248275 fps measured at block 4; scale for your GPU)");
       } else {
@@ -340,6 +348,7 @@
       if (bNum("b-stealth-block") !== null) parts.push("--stealth-block " + bNum("b-stealth-block"));
       if (bNum("b-stealth-intensity") !== null) parts.push("--stealth-intensity " + bNum("b-stealth-intensity"));
       if (bEl("b-stealth-dense").checked) parts.push("--stealth-dense");
+      if (bEl("b-stealth-no-audio").checked) parts.push("--stealth-no-audio");
     } else {
       if (bNum("b-block-size") !== null) parts.push("--block-size " + bNum("b-block-size"));
       if (bEl("b-chroma").checked) parts.push("--chroma");
@@ -381,6 +390,7 @@
     "b-source-size", "b-source-name", "b-output", "b-width", "b-height", "b-block-size", "b-fps",
     "b-chroma", "b-intra", "b-compress", "b-crf", "b-preset", "b-ecc", "b-pbkdf2",
     "b-no-password", "b-password", "b-password-file", "b-stealth", "b-stealth-block",
+    "b-stealth-no-audio",
     "b-stealth-intensity", "b-stealth-dense", "b-gpu", "b-threads", "b-optimise"];
   const CLAMPS = { "b-fps": [1, 60], "b-crf": [0, 51], "b-ecc": [1, 127], "b-pbkdf2": [1, 2147483647],
     "b-threads": [0, 256], "b-stealth-intensity": [5, 50], "b-source-size": [1, 9007199254740991] };
@@ -464,6 +474,7 @@
       gpu: bVal("b-gpu"), optimise: bVal("b-optimise"),
       stealth_intensity: bVal("b-stealth-intensity"), stealth_block: bVal("b-stealth-block"),
       stealth_dense: bEl("b-stealth-dense").checked,
+      stealth_no_audio: bEl("b-stealth-no-audio").checked,
     };
     FIELDS.forEach((field) => {
       const node = el(field);
