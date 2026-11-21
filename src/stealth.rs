@@ -22,7 +22,6 @@ use anyhow::{Context, Result, ensure};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
 use tempfile::NamedTempFile;
 
 /// Pixels per modulation block; every data bit occupies a pair of two
@@ -463,28 +462,15 @@ pub(crate) fn encode<R: Read>(
         .stdout(Stdio::null());
     let mut process = tools.spawn(cmd)?;
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
-    // Modulation runs on its own thread: while it modulates frame N and
-    // feeds the encoder, this thread reads background frame N+1 and keeps
-    // consuming the error-corrected payload stream.
-    let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, Vec<bool>)>(2);
-    let (spare_tx, spare_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        modulator(
-            geometry,
-            pipe,
-            Progress::new("Encode", frames),
-            rx,
-            spare_tx,
-        )
-    });
     let mut writer = Writer {
+        pipe,
         bg_pipe,
         geometry,
         image: vec![0; frame_len(geometry)],
         bits: Vec::with_capacity(geometry.bits_per_frame()),
-        tx: Some(tx),
-        spare_rx,
-        worker: Some(worker),
+        progress: Progress::new("Encode", frames),
+        sent: 0,
+        bytes: 0,
     };
     let outcome = (|| -> Result<u64> {
         let codec = ecc::Codec::new(settings.parity);
@@ -512,42 +498,14 @@ pub(crate) fn encode<R: Read>(
 }
 
 struct Writer {
+    pipe: ChildStdin,
     bg_pipe: ChildStdout,
     geometry: Geometry,
-    /// Frame currently being assembled on this thread.
     image: Vec<u8>,
     bits: Vec<bool>,
-    /// Sends completed frames to the modulator thread; `None` after finish.
-    tx: Option<mpsc::SyncSender<(Vec<u8>, Vec<bool>)>>,
-    /// Returns modulated frames from the modulator thread for reuse.
-    spare_rx: mpsc::Receiver<(Vec<u8>, Vec<bool>)>,
-    worker: Option<std::thread::JoinHandle<Result<u64>>>,
-}
-
-/// The modulator thread: takes assembled frames, modulates them onto the
-/// background image, and writes them to the encoder while the writers'
-/// thread keeps reading background frames and the error-correction stream.
-/// Returns the number of frames written.
-fn modulator(
-    geometry: Geometry,
-    mut pipe: ChildStdin,
-    mut progress: Progress,
-    rx: mpsc::Receiver<(Vec<u8>, Vec<bool>)>,
-    spare_tx: mpsc::Sender<(Vec<u8>, Vec<bool>)>,
-) -> Result<u64> {
-    let mut sent = 0u64;
-    let mut bytes = 0u64;
-    while let Ok((mut image, bits)) = rx.recv() {
-        modulate(&mut image, geometry, &bits);
-        pipe.write_all(&image)
-            .context("could not send a modulated frame to FFmpeg")?;
-        bytes += bits.len() as u64 / 8 + u64::from(bits.len() % 8 != 0);
-        sent += 1;
-        progress.update(sent, bytes);
-        // Unbounded: this never blocks the encoder intake.
-        let _ = spare_tx.send((image, bits));
-    }
-    Ok(sent)
+    progress: Progress,
+    sent: u64,
+    bytes: u64,
 }
 
 impl Writer {
@@ -568,67 +526,32 @@ impl Writer {
         }
         self.bits.push(one);
         if self.bits.len() == self.geometry.bits_per_frame() {
-            self.cycle_frame()?;
+            self.emit_frame()?;
         }
         Ok(())
     }
 
-    /// Hands the completed frame to the modulator thread and replenishes the
-    /// buffers from the recycle channel, keeping the buffers in-flight at
-    /// two so the background read, the modulation and the encoder's intake
-    /// all overlap.
-    fn cycle_frame(&mut self) -> Result<()> {
-        let image = std::mem::take(&mut self.image);
-        let bits = std::mem::take(&mut self.bits);
-        let tx = self
-            .tx
-            .as_ref()
-            .context("the stealth modulator has already stopped")?;
-        if let Err(_dropped) = tx.send((image, bits)) {
-            return Err(self.modulator_failure());
-        }
-        match self.spare_rx.try_recv() {
-            Ok((image, bits)) => {
-                self.image = image;
-                self.bits = bits;
-                self.bits.clear();
-            }
-            Err(_) => {
-                self.image = vec![0; frame_len(self.geometry)];
-                self.bits = Vec::with_capacity(self.geometry.bits_per_frame());
-            }
-        }
+    /// Modulates the assembled frame onto the background image and writes
+    /// it to the encoder.
+    fn emit_frame(&mut self) -> Result<()> {
+        modulate(&mut self.image, self.geometry, &self.bits);
+        self.pipe
+            .write_all(&self.image)
+            .context("could not send a modulated frame to FFmpeg")?;
+        self.bytes += self.bits.len() as u64 / 8 + u64::from(!self.bits.len().is_multiple_of(8));
+        self.sent += 1;
+        self.progress.update(self.sent, self.bytes);
+        self.bits.clear();
         Ok(())
     }
 
-    /// Recovers the modulator thread's result after it stopped early; the
-    /// dropped channel was the symptom, the error it returned is the cause.
-    fn modulator_failure(&mut self) -> anyhow::Error {
-        self.tx = None;
-        match self.worker.take() {
-            Some(handle) => match handle.join() {
-                Ok(Ok(_)) => anyhow::anyhow!("the stealth modulator stopped unexpectedly"),
-                Ok(Err(error)) => error,
-                Err(panic) => anyhow::anyhow!("the stealth modulator panicked: {panic:?}"),
-            },
-            None => anyhow::anyhow!("the stealth modulator stopped unexpectedly"),
-        }
-    }
-
-    fn finish(&mut self) -> Result<u64> {
+    /// Consumes the writer so the encoder's stdin is closed and FFmpeg
+    /// finalises the file, and returns the number of frames written.
+    fn finish(mut self) -> Result<u64> {
         if !self.bits.is_empty() {
-            self.cycle_frame()?;
+            self.emit_frame()?;
         }
-        self.tx = None;
-        match self.worker.take() {
-            Some(handle) => handle
-                .join()
-                .map_err(|panic| anyhow::anyhow!("the stealth modulator panicked: {panic:?}"))
-                .and_then(|sent| sent),
-            None => Err(anyhow::anyhow!(
-                "the stealth modulator stopped unexpectedly"
-            )),
-        }
+        Ok(self.sent)
     }
 }
 
