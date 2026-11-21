@@ -169,6 +169,66 @@ fn round_trip_non_aligned_frames_and_multiple_crypto_chunks() {
     }));
 }
 
+// Small resolutions used to be rejected with "frame too small for the video
+// header" even though the compact cell video (256x256 or larger) always
+// carries the header; only the display grid's own layout matters.
+#[test]
+fn round_trip_small_display_resolutions() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let data: Vec<u8> = (0..12_345u32).map(|i| (i * 37) as u8).collect();
+    fs::write(dir.join("payload.bin"), &data).unwrap();
+
+    for (width, height, block) in [
+        (320usize, 240usize, 8usize),
+        (640, 360, 10),
+        (1440, 720, 20),
+    ] {
+        let video = format!("small-{width}x{height}x{block}.mp4");
+        let restored = format!("small-{width}x{height}x{block}.bin");
+        success(cli(
+            dir,
+            &[
+                "encode",
+                "payload.bin",
+                &video,
+                "--width",
+                &width.to_string(),
+                "--height",
+                &height.to_string(),
+                "--block-size",
+                &block.to_string(),
+                "--preset",
+                "ultrafast",
+                "--no-password",
+                "--pbkdf2-iterations",
+                "1000",
+            ],
+        ));
+        success(cli(dir, &["decode", &video, &restored]));
+        assert_eq!(fs::read(dir.join(&restored)).unwrap(), data, "{video}");
+    }
+
+    // Genuinely impossible display layouts still fail up front.
+    let uneven = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "uneven.mp4",
+            "--width",
+            "640",
+            "--height",
+            "360",
+            "--block-size",
+            "12",
+            "--no-password",
+        ],
+    );
+    assert!(!uneven.status.success());
+    assert!(!dir.join("uneven.mp4").exists());
+}
+
 #[test]
 fn round_trip_chroma_and_all_intra_options() {
     let temp = tempfile::tempdir().unwrap();
