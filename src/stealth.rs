@@ -14,7 +14,7 @@
 
 use crate::ecc;
 use crate::format::{
-    ECC_SIZE, Grid, Layout, TRANSPORT_SIZE, Transport, parse_transport, transport,
+    ECC_SIZE, Grid, Layout, TRANSPORT_SIZE, Transport, parse_transport, stealth_transport,
     validate_resolution,
 };
 use crate::video::{Encoder, Progress, Tools, local_path};
@@ -25,7 +25,7 @@ use std::path::Path;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::NamedTempFile;
 
-/// Pixels per modulation block; every data bit occupies a pair of two
+/// Pixels per modulation block; every data symbol occupies a pair of two
 /// horizontally adjacent blocks. This is the default; `--stealth-block`
 /// overrides it (smaller blocks carry more data per frame). Block 4 gets
 /// a 1 GiB archive close to a regular encode's wall time; block 6 stays
@@ -34,11 +34,17 @@ pub const BLOCK: usize = 4;
 /// Even block sizes tried by the blind decoder, in probe order: the default
 /// first, then the faster smaller blocks, then the sturdier larger ones.
 const CANDIDATE_BLOCKS: [usize; 8] = [4, 6, 2, 8, 10, 12, 14, 16];
-/// Luma delta applied to each block of a pair.
-pub const MODULATION: i16 = 25;
-/// The background luma is clamped to this range before modulation.
-pub const BASE_LOW: u8 = 55;
-pub const BASE_HIGH: u8 = 200;
+/// The data layer's outer luma level: the modulation levels sit at ±`intensity`
+/// and, at two bits per pair, ±`intensity`/3. Lower values hide the layer
+/// better; higher values are more visible but survive heavy re-encoding
+/// (YouTube, streaming platforms) far better. `--stealth-intensity`/
+/// `stealth_intensity` override the default.
+pub const INTENSITY: i16 = 25;
+/// The valid `--stealth-intensity` range. At the maximum the background
+/// still keeps 50 luma levels of its own range, and every modulation level
+/// stays reachable within the 30..=225 sample clamp at any block brightness.
+pub const MIN_INTENSITY: i16 = 5;
+pub const MAX_INTENSITY: i16 = 50;
 /// Anchor rows along the top and bottom borders and anchor columns on both
 /// side borders carry a static checkerboard pattern for grid alignment.
 pub const ANCHOR_TOP_ROWS: usize = 3;
@@ -56,16 +62,19 @@ const ANCHOR_MARGIN: u32 = 6;
 /// shifted candidate from winning the alignment score.
 const DIFFERENT_SUM_SENTINEL: u64 = 0;
 
-/// Fixed stealth-layer geometry derived from the output resolution and the
-/// modulation block size.
+/// Fixed stealth-layer geometry derived from the output resolution, the
+/// modulation block size, the modulation depth and the layer intensity.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub width: usize,
     pub height: usize,
     pub block: usize,
-    /// Bits carried by one block pair: 2 for the current quaternary
-    /// modulation, 1 for the legacy binary layer (decode compatibility).
+    /// Bits carried by one block pair: 2 for the default quaternary
+    /// modulation, 4 for the dense sixteen-level layer, and 1 for the legacy
+    /// binary layer (decode compatibility).
     pub symbol_bits: usize,
+    /// The layer's outer luma level (see [`INTENSITY`]).
+    pub intensity: i16,
     columns: usize,
     rows: usize,
     pairs: usize,
@@ -75,21 +84,46 @@ pub struct Geometry {
 impl Geometry {
     /// The current stealth layout: two modulation bits per block pair.
     pub fn new(width: usize, height: usize, block: usize) -> Result<Self> {
-        Self::build(width, height, block, 2)
+        Self::build(width, height, block, 2, INTENSITY)
+    }
+
+    /// The dense stealth layout: four modulation bits per block pair across
+    /// sixteen levels with the same outer span, twice the payload per frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn dense(width: usize, height: usize, block: usize) -> Result<Self> {
+        Self::build(width, height, block, 4, INTENSITY)
     }
 
     /// The pre-density-stealth layout: one modulation bit per block pair.
     /// Encoding no longer produces this; the decoder still probes for it so
     /// older videos keep restoring.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn legacy(width: usize, height: usize, block: usize) -> Result<Self> {
-        Self::build(width, height, block, 1)
+        Self::build(width, height, block, 1, INTENSITY)
     }
 
-    fn build(width: usize, height: usize, block: usize, symbol_bits: usize) -> Result<Self> {
+    /// The full-parameter constructor: `symbol_bits` selects the modulation
+    /// depth (1 legacy, 2 default, 4 dense) and `intensity` the outer luma
+    /// level of the data layer.
+    pub fn build(
+        width: usize,
+        height: usize,
+        block: usize,
+        symbol_bits: usize,
+        intensity: i16,
+    ) -> Result<Self> {
         validate_resolution(width, height)?;
         ensure!(
             width.is_multiple_of(block) && height.is_multiple_of(block),
             "the stealth video resolution must be a multiple of {block} pixels"
+        );
+        ensure!(
+            matches!(symbol_bits, 1 | 2 | 4),
+            "unsupported modulation depth"
+        );
+        ensure!(
+            (MIN_INTENSITY..=MAX_INTENSITY).contains(&intensity),
+            "the stealth intensity must be in {MIN_INTENSITY}..={MAX_INTENSITY}"
         );
         let columns = width / block;
         let rows = height / block;
@@ -109,6 +143,7 @@ impl Geometry {
             height,
             block,
             symbol_bits,
+            intensity,
             columns,
             rows,
             pairs,
@@ -127,11 +162,23 @@ impl Geometry {
             || col >= self.columns - ANCHOR_COLS
     }
 
+    /// The data rows also cover the top rows' inner blocks (the encode and
+    /// decode agree on that layout), so only the border side columns and the
+    /// bottom anchor row's blocks actually carry the checkerboard. The
+    /// alignment score and the intensity measurement must not count the
+    /// overwritten positions: their data content would dilute both.
+    fn carries_anchor(&self, col: usize, row: usize) -> bool {
+        self.is_anchor(col, row)
+            && (col < ANCHOR_COLS
+                || col >= self.columns - ANCHOR_COLS
+                || row >= self.rows - ANCHOR_TOP_ROWS - ANCHOR_BOTTOM_ROWS)
+    }
+
     fn anchor_count(&self) -> usize {
         (0..self.rows)
             .map(|row| {
                 (0..self.columns)
-                    .filter(|&col| self.is_anchor(col, row))
+                    .filter(|&col| self.carries_anchor(col, row))
                     .count()
             })
             .sum()
@@ -146,6 +193,12 @@ pub struct StealthSettings {
     /// (identity) scale filter when the background already matches.
     pub rescale: bool,
     pub block: usize,
+    /// Modulation bits per block pair: 2 by default, 4 with `--stealth-dense`
+    /// (double the data rate over the same outer luma span).
+    pub symbol_bits: usize,
+    /// The data layer's outer luma level (default `INTENSITY`); higher is
+    /// more visible and survives aggressive re-encoding better.
+    pub intensity: i16,
     pub fps: u8,
     pub crf: u8,
     pub preset: String,
@@ -155,11 +208,11 @@ pub struct StealthSettings {
     pub parity: usize,
 }
 
-fn anchor_value(col: usize, row: usize) -> u8 {
+fn anchor_value(col: usize, row: usize, intensity: i16) -> u8 {
     if (col + row).is_multiple_of(2) {
-        ANCHOR_MID + MODULATION as u8
+        ANCHOR_MID + intensity as u8
     } else {
-        ANCHOR_MID - MODULATION as u8
+        ANCHOR_MID - intensity as u8
     }
 }
 
@@ -170,16 +223,20 @@ fn fill_block(image: &mut [u8], block: usize, width: usize, x0: usize, y0: usize
     }
 }
 
-/// Per-pixel difference between a pair's outer modulation levels. The four
-/// levels sit at ±(LEVEL_RANGE/3)/2 and ±(LEVEL_RANGE)/2 around the pair
-/// mean, so the outer levels hit the same ±25-per-pixel swing the legacy
-/// binary layer used, and the two added inner levels halve the noise
-/// margin per symbol in exchange for double the data rate.
-const LEVEL_RANGE: i64 = 50;
+/// Sum distance between adjacent modulation levels for a block of `area`:
+/// `n` levels (with `n = 1 << symbol_bits`) span the same ±`intensity` luma
+/// range, so the step narrows as the depth grows. Both the modulator and the
+/// demodulator derive this from the same formula, so quantisation is exact.
+fn level_step(area: i64, symbol_bits: usize, intensity: i16) -> i64 {
+    area * 2 * i64::from(intensity) / ((1i64 << symbol_bits) - 1)
+}
 
-/// Sum distance between adjacent modulation levels for a block of `area`.
-fn level_step(area: i64) -> i64 {
-    area * LEVEL_RANGE / 3
+/// The background luma is clamped to a range that leaves `intensity` levels
+/// of headroom to the fixed 30..=225 sample extremes, so every modulation
+/// level stays reachable from any clamped block. At the default intensity
+/// 25 this reproduces the original 55..=200 window.
+fn base_range(intensity: i16) -> (u8, u8) {
+    ((30 + intensity) as u8, (225 - intensity) as u8)
 }
 
 /// Prepares one frame for encoding: clamps the background luma, stamps the
@@ -197,15 +254,15 @@ fn fetch_bit(bits: &[u8], index: usize) -> bool {
 
 /// `symbol_bits`-bit symbol `index` of a big-endian byte-aligned bitstream.
 fn fetch_symbol(bits: &[u8], index: usize, symbol_bits: usize) -> u8 {
-    debug_assert_eq!(symbol_bits, 2);
     let offset = index * symbol_bits;
-    (bits[offset / 8] >> (8 - offset % 8 - symbol_bits)) & 3
+    (bits[offset / 8] >> (8 - offset % 8 - symbol_bits)) & ((1 << symbol_bits) - 1)
 }
 
 pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, bits: &[u8]) {
     let width = geometry.width;
+    let (low, high) = base_range(geometry.intensity);
     for value in &mut image[..width * geometry.height] {
-        *value = (*value).clamp(BASE_LOW, BASE_HIGH);
+        *value = (*value).clamp(low, high);
     }
     for row in 0..geometry.rows {
         modulate_row_at(image, geometry, dx, row * geometry.block + dy, bits, row);
@@ -223,13 +280,58 @@ fn block_sum(image: &[u8], block: usize, width: usize, x0: usize, y0: usize) -> 
     sum
 }
 
-fn shift_towards(image: &mut [u8], block: usize, width: usize, x0: usize, y0: usize, delta: i32) {
+/// Rewrites one block so its pixel sum hits `target` exactly. A uniform
+/// shift cannot always reach the target (individual pixels clamp against
+/// the fixed 30..=225 extremes long before the pair-mean correction is
+/// done), and the truncation loss of a uniform shift is up to `area` sum
+/// units - more than the dense layer's quantisation half-step. So the
+/// adjustment is spread pixel by pixel with suffix headroom bookkeeping:
+/// every pixel moves as far as needed while staying inside 30..=225, and
+/// the pair's mean-centring and level shift land exactly.
+///
+/// Feasibility is guaranteed: `base_range` clamps the background to
+/// [30+intensity, 225-intensity] and the modulation levels never ask for
+/// more than `intensity * area` of sum change, so the target always lies
+/// within the block's reachable 30*area..=225*area sum span.
+fn set_block_sum(image: &mut [u8], block: usize, width: usize, x0: usize, y0: usize, target: i64) {
+    let area = (block * block) as i64;
+    let target = target.clamp(30 * area, 225 * area);
+    let mut sum = 0i64;
+    let mut head_down = 0i64;
+    let mut head_up = 0i64;
     for y in y0..y0 + block {
         let start = y * width + x0;
-        for value in &mut image[start..start + block] {
-            *value = (i32::from(*value) + delta).clamp(30, 225) as u8;
+        for &value in &image[start..start + block] {
+            sum += i64::from(value);
+            head_down += i64::from(value - 30);
+            head_up += i64::from(225 - value);
         }
     }
+    let mut remaining = target - sum;
+    debug_assert!((-head_down..=head_up).contains(&remaining));
+    // Spread the needed change as an even per-pixel share, then give each
+    // pixel the share it can actually take: the share is clamped to the
+    // interval that still leaves the not-yet-visited pixels enough headroom
+    // to absorb what is left, and to this pixel's own 30..=225 room.
+    let mut seen_down = 0i64;
+    let mut seen_up = 0i64;
+    for y in y0..y0 + block {
+        let start = y * width + x0;
+        for (inner, value) in image[start..start + block].iter_mut().enumerate() {
+            let position = (y - y0) * block + inner;
+            let (down, up) = (i64::from(*value - 30), i64::from(225 - *value));
+            let suffix_down = head_down - seen_down - down;
+            let suffix_up = head_up - seen_up - up;
+            let give = (remaining / (area - position as i64))
+                .clamp(remaining - suffix_up, remaining + suffix_down)
+                .clamp(-down, up);
+            *value = (*value as i64 + give) as u8;
+            remaining -= give;
+            seen_down += down;
+            seen_up += up;
+        }
+    }
+    debug_assert_eq!(remaining, 0, "the modulation target must be reachable");
 }
 
 pub fn modulate(image: &mut [u8], geometry: Geometry, bits: &[u8]) {
@@ -255,12 +357,13 @@ fn modulate_parallel(image: &mut [u8], geometry: Geometry, bits: &[u8]) {
     const ROWS_PER_TASK: usize = 4;
     let luma = geometry.width * geometry.height;
     let row_bytes = geometry.width * geometry.block;
+    let (low, high) = base_range(geometry.intensity);
     image[..luma]
         .par_chunks_mut(row_bytes * ROWS_PER_TASK)
         .enumerate()
         .for_each(|(chunk, slice)| {
             for value in slice.iter_mut() {
-                *value = (*value).clamp(BASE_LOW, BASE_HIGH);
+                *value = (*value).clamp(low, high);
             }
             for inside in 0..ROWS_PER_TASK {
                 let row = chunk * ROWS_PER_TASK + inside;
@@ -302,13 +405,16 @@ fn modulate_row_at(
                 width,
                 col * block + dx,
                 y0,
-                anchor_value(col, row),
+                anchor_value(col, row, geometry.intensity),
             );
         }
     }
     let area = (block * block) as i64;
-    let step = area * i64::from(MODULATION);
-    let level = level_step(area);
+    let step = if geometry.symbol_bits == 1 {
+        area * i64::from(geometry.intensity)
+    } else {
+        level_step(area, geometry.symbol_bits, geometry.intensity)
+    };
     let symbols = bits.len() * 8 / geometry.symbol_bits;
     for pair in 0..geometry.pairs {
         let index = row * geometry.pairs + pair;
@@ -328,26 +434,14 @@ fn modulate_row_at(
                 (middle - step, middle + step)
             }
         } else {
+            // `n` evenly spaced levels over ±`intensity` luma; the encoding
+            // and decoding steps are identical so target rounding is exact.
             let symbol = fetch_symbol(bits, index, geometry.symbol_bits);
-            let delta = (2 * symbol as i64 - 3) * level / 2;
+            let delta = (2 * symbol as i64 - ((1i64 << geometry.symbol_bits) - 1)) * step / 2;
             (middle + delta, middle - delta)
         };
-        shift_towards(
-            image,
-            block,
-            width,
-            x0,
-            y0,
-            i32::try_from((target_a - sum_a) / area).unwrap_or(0),
-        );
-        shift_towards(
-            image,
-            block,
-            width,
-            x1,
-            y0,
-            i32::try_from((target_b - sum_b) / area).unwrap_or(0),
-        );
+        set_block_sum(image, block, width, x0, y0, target_a);
+        set_block_sum(image, block, width, x1, y0, target_b);
     }
 }
 
@@ -407,7 +501,7 @@ pub fn find_alignment(y: &[u8], geometry: Geometry, raster: &mut Raster) -> Opti
             let mut score = 0i64;
             for row in 0..geometry.rows {
                 for col in 0..geometry.columns {
-                    if !geometry.is_anchor(col, row) {
+                    if !geometry.carries_anchor(col, row) {
                         continue;
                     }
                     let mean = i64::try_from(raster.sum(col * block + dx, row * block + dy, block))
@@ -432,14 +526,13 @@ pub fn find_alignment(y: &[u8], geometry: Geometry, raster: &mut Raster) -> Opti
 
 /// Demodulates `out.len()` bytes from a frame. Legacy layers carry one bit
 /// per pair (one when the first block's mean luma tops the second's);
-/// current layers quantise the block-mean difference into four levels that
-/// each stand for two bits. `raster.scan` must have run on the same `y`
-/// plane first.
+/// current layers quantise the block-mean difference into 4 or 16 levels
+/// that each stand for `symbol_bits` bits. `raster.scan` must have run on
+/// the same `y` plane first.
 pub fn demodulate(geometry: Geometry, offset: (usize, usize), raster: &Raster, out: &mut [u8]) {
     let (dx, dy) = offset;
     let block = geometry.block;
     let area = (block * block) as i64;
-    let level = level_step(area);
     let carrier = geometry.pairs * geometry.symbol_bits;
     for (byte_index, byte) in out.iter_mut().enumerate() {
         let mut value = 0u8;
@@ -455,12 +548,16 @@ pub fn demodulate(geometry: Geometry, offset: (usize, usize), raster: &Raster, o
             let one = if geometry.symbol_bits == 1 {
                 a > b
             } else {
-                // Nearest-level decision: the levels sit 2*level apart, so
-                // (diff + 4*level) / (2*level) rounds to the level index
-                // clamped to the four valid symbols.
+                // Nearest-level decision: the levels sit 2*step apart, so
+                // (diff + n*step) / (2*step) rounds to the level index,
+                // clamped to the valid symbols.
+                let levels = 1i64 << geometry.symbol_bits;
+                let step = level_step(area, geometry.symbol_bits, geometry.intensity);
                 let diff = a as i64 - b as i64;
-                let symbol = (diff + 4 * level).div_euclid(2 * level).clamp(0, 3);
-                (symbol as u8 >> (1 - sub)) & 1 == 1
+                let symbol = (diff + levels * step)
+                    .div_euclid(2 * step)
+                    .clamp(0, levels - 1);
+                (symbol as u8 >> (geometry.symbol_bits - 1 - sub)) & 1 == 1
             };
             if one {
                 value |= 1 << (7 - bit);
@@ -487,8 +584,14 @@ pub(crate) fn encode<R: Read>(
     dir: &Path,
     mut stream: R,
 ) -> Result<NamedTempFile> {
-    let geometry = Geometry::new(settings.width, settings.height, settings.block)?;
-    let transport_header = transport(
+    let geometry = Geometry::build(
+        settings.width,
+        settings.height,
+        settings.block,
+        settings.symbol_bits,
+        settings.intensity,
+    )?;
+    let transport_header = stealth_transport(
         Grid {
             width: settings.width,
             height: settings.height,
@@ -496,9 +599,8 @@ pub(crate) fn encode<R: Read>(
         },
         settings.parity,
         layout.protected,
-        4,
-        true,
-        false,
+        settings.symbol_bits as u8,
+        settings.intensity as u8,
     );
     let header_bytes = (MARKER.len() + TRANSPORT_SIZE) as u64;
     let coded = layout.protected - ECC_SIZE as u64;
@@ -774,14 +876,17 @@ fn candidate_blocks(width: usize, height: usize) -> impl Iterator<Item = usize> 
 }
 
 impl<R: Read> Reader<R> {
-    /// Opens a stealth stream without knowing the encoder's block size or
-    /// modulation depth: every even candidate block that fits the resolution
-    /// is demodulated with the quaternary (two bits per pair) and the legacy
-    /// (one bit per pair) layers from the incoming frames until the sync
-    /// marker, transport header and the header's own block size all agree on
-    /// one candidate. The default block is probed first, then the faster
-    /// smaller ones, then the sturdier larger ones. Only the frames needed
-    /// for detection are consumed.
+    /// Opens a stealth stream without knowing the encoder's block size,
+    /// modulation depth or intensity: every even candidate block that fits
+    /// the resolution is demodulated with the quaternary (two bits per
+    /// pair), dense (four bits per pair) and legacy (one bit per pair)
+    /// layers from the incoming frames until the sync marker, transport
+    /// header and the header's own block size all agree on one candidate.
+    /// The layer intensity is measured from the anchor checkerboard, so the
+    /// probe matches the written layer without trying every setting. The
+    /// default block is probed first, then the faster smaller ones, then
+    /// the sturdier larger ones. Only the frames needed for detection are
+    /// consumed.
     pub(crate) fn open(mut pipe: R, width: usize, height: usize) -> Result<Self> {
         let luma = width * height;
         let mut image = vec![0; luma * 3 / 2];
@@ -799,11 +904,12 @@ impl<R: Read> Reader<R> {
             let Some(at) = find_alignment(&image[..luma], probe, &mut raster) else {
                 continue;
             };
-            let mut variants = vec![probe];
-            if let Ok(geometry) = Geometry::legacy(width, height, block) {
-                variants.push(geometry);
-            }
-            for geometry in variants {
+            let intensity = measured_intensity(&raster, probe, at);
+            for symbol_bits in [2usize, 4, 1] {
+                let Ok(geometry) = Geometry::build(width, height, block, symbol_bits, intensity)
+                else {
+                    continue;
+                };
                 let mut buffer = Vec::new();
                 demodulate(
                     geometry,
@@ -829,9 +935,17 @@ impl<R: Read> Reader<R> {
                 let Ok(parsed) = parse_transport(&buffer[MARKER.len()..HEADER_BYTES]) else {
                     continue;
                 };
+                // Videos written before the depth/intensity fields existed
+                // leave both at zero; trust the probe for those.
+                let depth_match =
+                    parsed.symbol_bits == 0 || parsed.symbol_bits as usize == geometry.symbol_bits;
+                let intensity_match = parsed.intensity as i64 == 0
+                    || (i64::from(parsed.intensity) - i64::from(geometry.intensity)).abs() <= 2;
                 if parsed.width == width
                     && parsed.height == height
                     && parsed.block == geometry.block
+                    && depth_match
+                    && intensity_match
                 {
                     winner = Some((index, parsed));
                     break;
@@ -925,6 +1039,37 @@ fn push_frame(buffer: &mut Vec<u8>, frame_bytes: usize) -> &mut [u8] {
     &mut buffer[start..]
 }
 
+/// Estimates the layer intensity from the anchor checkerboard: the even
+/// anchor blocks sit at `ANCHOR_MID + intensity` luma, the odd ones at
+/// `ANCHOR_MID - intensity`, and averaging hundreds of pixels swamps the
+/// compression noise. `raster` must have scanned the same plane.
+fn measured_intensity(raster: &Raster, geometry: Geometry, (dx, dy): (usize, usize)) -> i16 {
+    let block = geometry.block;
+    let area = block * block;
+    let mut even = 0i64;
+    let mut odd = 0i64;
+    for row in 0..geometry.rows {
+        for col in 0..geometry.columns {
+            if !geometry.carries_anchor(col, row) {
+                continue;
+            }
+            let sum =
+                i64::try_from(raster.sum(col * block + dx, row * block + dy, block)).unwrap_or(0);
+            if (col + row).is_multiple_of(2) {
+                even += sum;
+            } else {
+                odd += sum;
+            }
+        }
+    }
+    let pixels = (geometry.anchor_count() * area) as i64;
+    // Even and odd anchor blocks are equally numerous; their pixel sum
+    // difference is `pixels * intensity`.
+    let estimate =
+        ((even - odd) / pixels).clamp(i64::from(MIN_INTENSITY), i64::from(MAX_INTENSITY));
+    estimate as i16
+}
+
 impl<R: Read> Read for Reader<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
@@ -982,14 +1127,37 @@ mod tests {
                 .frame_bytes(),
             small.frame_bytes() / 2
         );
+        // Dense doubles the bits per frame (four per pair) over the same
+        // block grid; truncation to whole bytes cannot lose more than one.
+        let dense = Geometry::dense(WIDTH, HEIGHT, super::BLOCK).unwrap();
+        assert_eq!(dense.frame_bytes(), 464);
+        assert!(
+            dense.frame_bytes() >= small.frame_bytes() * 2 - 1,
+            "dense must double the payload per frame"
+        );
+        // The intensity only spreads the same levels wider or narrower.
+        assert_eq!(
+            Geometry::build(WIDTH, HEIGHT, super::BLOCK, 2, 50)
+                .unwrap()
+                .frame_bytes(),
+            small.frame_bytes()
+        );
+        assert!(
+            Geometry::build(WIDTH, HEIGHT, super::BLOCK, 2, 4).is_err(),
+            "the intensity range must be bounded"
+        );
         assert!(Geometry::new(24, 12, super::BLOCK).is_err());
     }
 
     #[test]
     fn modulation_round_trips_through_clamping() {
-        // Both the default and the sturdier block must round trip.
+        // The default and sturdier blocks, the dense sixteen-level layer and
+        // both intensity extremes must all round trip.
         for block in [super::BLOCK, 6] {
             round_trip(block);
+            round_trip_with(Geometry::build(WIDTH, HEIGHT, block, 4, super::INTENSITY).unwrap());
+            round_trip_with(Geometry::build(WIDTH, HEIGHT, block, 2, 50).unwrap());
+            round_trip_with(Geometry::build(WIDTH, HEIGHT, block, 2, 5).unwrap());
         }
     }
 

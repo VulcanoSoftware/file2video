@@ -569,3 +569,154 @@ fn stealth_round_trip_with_looping_background_audio() {
         "expected an even-block rejection, got: {stderr}"
     );
 }
+
+#[test]
+fn stealth_dense_with_configured_intensity_round_trips() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut seed = 0x51de_c0deu32;
+    let data: Vec<u8> = (0..12_288u32)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    fs::write(dir.join("payload.bin"), &data).unwrap();
+
+    // One second of 240x144 background; both intensity and dense mode come
+    // from the config file and the CLI must win over them.
+    fs::write(
+        dir.join("file2video.conf"),
+        "stealth_intensity = 5\nstealth_dense = off\nstealth_block = 6\n",
+    )
+    .unwrap();
+    success(
+        Command::new("ffmpeg")
+            .current_dir(dir)
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=240x144:rate=10:duration=1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "background.mp4",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let encoded = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-dense.mp4",
+            "--stealth",
+            "background.mp4",
+            "--stealth-dense",
+            "--stealth-intensity",
+            "35",
+            "--fps",
+            "10",
+            "--preset",
+            "ultrafast",
+            "--no-password",
+        ],
+    );
+    success(encoded.clone());
+    let stderr = String::from_utf8_lossy(&encoded.stderr);
+    assert!(
+        stderr.contains("dense") && stderr.contains("intensity 35"),
+        "expected the dense mode and the explicit intensity in the message, got: {stderr}"
+    );
+
+    // Blind decode: no flags at all; the decoder probes the symbol depth
+    // and measures the intensity from the anchor blocks.
+    success(cli(
+        dir,
+        &["decode", "stealth-dense.mp4", "restored-dense.bin"],
+    ));
+    assert_eq!(fs::read(dir.join("restored-dense.bin")).unwrap(), data);
+
+    // Dense doubles the payload per frame, so it needs fewer frames than
+    // the default depth for the same file.
+    let frames = |file: &str| {
+        let probe = Command::new("ffprobe")
+            .current_dir(dir)
+            .args(["-v", "error", "-count_frames", "-select_streams", "v:0"])
+            .args([
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
+                file,
+            ])
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let default_encode = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-default.mp4",
+            "--stealth",
+            "background.mp4",
+            "--fps",
+            "10",
+            "--preset",
+            "ultrafast",
+            "--no-password",
+        ],
+    );
+    success(default_encode);
+    assert!(
+        frames("stealth-dense.mp4") < frames("stealth-default.mp4"),
+        "dense mode must fit the payload in fewer frames"
+    );
+    // The config-driven intensity (5) and dense off must hold when no flag
+    // overrides them; a mild layer still restores byte-identically.
+    let mild_encode = cli(
+        dir,
+        &[
+            "encode",
+            "payload.bin",
+            "stealth-mild.mp4",
+            "--stealth",
+            "background.mp4",
+            "--fps",
+            "10",
+            "--preset",
+            "ultrafast",
+            "--no-password",
+        ],
+    );
+    success(mild_encode.clone());
+    success(cli(
+        dir,
+        &["decode", "stealth-mild.mp4", "restored-mild.bin"],
+    ));
+    assert_eq!(fs::read(dir.join("restored-mild.bin")).unwrap(), data);
+    let mild_stderr = String::from_utf8_lossy(&mild_encode.stderr);
+    assert!(
+        mild_stderr.contains("block 6"),
+        "expected the config's stealth_block to apply, got: {mild_stderr}"
+    );
+}

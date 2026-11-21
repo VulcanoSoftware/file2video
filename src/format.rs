@@ -86,6 +86,10 @@ pub struct Transport {
     pub cell_bits: u8,
     pub compact: bool,
     pub chroma: bool,
+    /// Stealth only: modulation bits per block pair (0 = not recorded).
+    pub symbol_bits: u8,
+    /// Stealth only: the outer luma level of the data layer (0 = not recorded).
+    pub intensity: u8,
 }
 
 pub fn transport(
@@ -116,6 +120,24 @@ pub fn transport(
         .0
         .iter_mut()
         .for_each(|copy| copy.copy_from_slice(&header));
+    out
+}
+
+/// A stealth transport header: records the modulation depth (bits per block
+/// pair) and intensity (the data layer's outer luma level) next to the
+/// shared layout fields so a blind decoder can rebuild the exact geometry.
+pub fn stealth_transport(
+    grid: Grid,
+    parity: usize,
+    protected: u64,
+    symbol_bits: u8,
+    intensity: u8,
+) -> [u8; TRANSPORT_SIZE] {
+    let mut out = transport(grid, parity, protected, 4, true, false);
+    for copy in out.as_chunks_mut::<64>().0.iter_mut() {
+        copy[10] = symbol_bits;
+        copy[11] = intensity;
+    }
     out
 }
 
@@ -167,6 +189,8 @@ pub fn parse_transport(data: &[u8]) -> Result<Transport> {
         cell_bits,
         compact,
         chroma,
+        symbol_bits: vote[10],
+        intensity: vote[11],
     })
 }
 
@@ -306,6 +330,13 @@ mod tests {
             }
         }
         assert!(parse_transport(&[0u8; 448]).is_err());
+        let stealth = parse_transport(&super::stealth_transport(grid, 64, 285, 4, 40)).unwrap();
+        assert_eq!(stealth.symbol_bits, 4);
+        assert_eq!(stealth.intensity, 40);
+        assert!(stealth.compact);
+        let plain = parse_transport(&transport(grid, 64, 285, 4, false, false)).unwrap();
+        assert_eq!(plain.symbol_bits, 0);
+        assert_eq!(plain.intensity, 0);
     }
 
     #[test]

@@ -95,6 +95,18 @@ enum Operation {
         /// re-encoding such as YouTube.
         #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u16).range(2..=16))]
         stealth_block: Option<u16>,
+        /// Stealth data layer visibility (luma levels, 5-50, default 25): the
+        /// outer modulation levels sit at ±this value. Higher values make the
+        /// layer easier to see but survive aggressive re-encoding (YouTube)
+        /// better; for dense mode use 40-50.
+        #[arg(long, value_name = "LUMA", value_parser = clap::value_parser!(u16).range(5..=50))]
+        stealth_intensity: Option<u16>,
+        /// Double the stealth data rate: sixteen modulation levels (four bits
+        /// per block pair) over the same luma span instead of four levels.
+        /// The level spacing narrows, so pair this with a higher
+        /// --stealth-intensity (40+) for aggressive distribution channels.
+        #[arg(long)]
+        stealth_dense: bool,
     },
     /// Recover and authenticate an original file from an MP4 video.
     Decode {
@@ -572,14 +584,32 @@ fn encode_stealth(
     password: Password,
     no_password: bool,
     stealth_block: Option<u16>,
+    stealth_intensity: Option<u16>,
+    stealth_dense: bool,
     options: Encoding,
     ctx: &Ctx,
 ) -> Result<u64> {
-    let block = usize::from(stealth_block.unwrap_or(u16::try_from(stealth::BLOCK).unwrap()));
+    let block = usize::from(
+        stealth_block
+            .or_else(|| ctx.config.stealth_block.map(|block| block as u16))
+            .unwrap_or(u16::try_from(stealth::BLOCK).unwrap()),
+    );
     ensure!(
         block.is_multiple_of(2),
         "--stealth-block must be an even number of pixels"
     );
+    let intensity = i16::try_from(
+        stealth_intensity
+            .map(usize::from)
+            .or(ctx.config.stealth_intensity)
+            .unwrap_or(stealth::INTENSITY as usize),
+    )
+    .context("--stealth-intensity out of range")?;
+    let symbol_bits = if stealth_dense || ctx.config.stealth_dense == Some(true) {
+        4
+    } else {
+        2
+    };
     // The chroma planes carry the background colours in stealth encoding, so
     // any chroma request (explicit flag or config default) is ignored with a
     // warning; a config default must never block a stealth encode. An
@@ -610,7 +640,8 @@ fn encode_stealth(
         .height
         .or(ctx.config.height)
         .unwrap_or_else(|| bg_height / block * block);
-    let geometry = stealth::Geometry::new(width, height, block)?;
+    let geometry = stealth::Geometry::build(width, height, block, symbol_bits, intensity)
+        .context("the stealth geometry does not fit these settings")?;
     let fps = options.fps.or(ctx.config.fps).unwrap_or(30);
     let crf = options.crf.or(ctx.config.crf).unwrap_or(18);
     let preset = options
@@ -651,10 +682,11 @@ fn encode_stealth(
         .div_ceil(u64::try_from(geometry.frame_bytes()).context("frame capacity overflow")?);
     if !ctx.quiet {
         eprintln!(
-            "Encoding {size} bytes as a stealth layer over {} at {}x{}, block {block}, {} fps, CRF {crf}, {parity} parity symbols; writing {frames} frames.",
+            "Encoding {size} bytes as a stealth layer over {} at {}x{}, block {block}{} at intensity {intensity}, {} fps, CRF {crf}, {parity} parity symbols; writing {frames} frames.",
             background.display(),
             width,
             height,
+            if symbol_bits == 4 { ", dense" } else { "" },
             fps
         );
     }
@@ -668,6 +700,8 @@ fn encode_stealth(
             height,
             rescale: width != bg_width || height != bg_height,
             block,
+            symbol_bits,
+            intensity,
             fps,
             crf,
             preset,
@@ -1509,6 +1543,8 @@ fn run() -> Result<()> {
             settings,
             stealth,
             stealth_block,
+            stealth_intensity,
+            stealth_dense,
         } => {
             let frames = match stealth {
                 Some(background) => encode_stealth(
@@ -1519,6 +1555,8 @@ fn run() -> Result<()> {
                     password,
                     no_password,
                     stealth_block,
+                    stealth_intensity,
+                    stealth_dense,
                     settings,
                     &ctx,
                 )?,
