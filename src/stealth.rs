@@ -60,6 +60,9 @@ pub struct Geometry {
     pub width: usize,
     pub height: usize,
     pub block: usize,
+    /// Bits carried by one block pair: 2 for the current quaternary
+    /// modulation, 1 for the legacy binary layer (decode compatibility).
+    pub symbol_bits: usize,
     columns: usize,
     rows: usize,
     pairs: usize,
@@ -67,7 +70,19 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// The current stealth layout: two modulation bits per block pair.
     pub fn new(width: usize, height: usize, block: usize) -> Result<Self> {
+        Self::build(width, height, block, 2)
+    }
+
+    /// The pre-density-stealth layout: one modulation bit per block pair.
+    /// Encoding no longer produces this; the decoder still probes for it so
+    /// older videos keep restoring.
+    pub fn legacy(width: usize, height: usize, block: usize) -> Result<Self> {
+        Self::build(width, height, block, 1)
+    }
+
+    fn build(width: usize, height: usize, block: usize, symbol_bits: usize) -> Result<Self> {
         validate_resolution(width, height)?;
         ensure!(
             width.is_multiple_of(block) && height.is_multiple_of(block),
@@ -81,7 +96,7 @@ impl Geometry {
         );
         let pairs = (columns - 2 * ANCHOR_COLS) / 2;
         ensure!(pairs > 0, "the video is too small to carry stealth data");
-        let bits = pairs * (rows - ANCHOR_TOP_ROWS - ANCHOR_BOTTOM_ROWS) / 8 * 8;
+        let bits = pairs * (rows - ANCHOR_TOP_ROWS - ANCHOR_BOTTOM_ROWS) * symbol_bits / 8 * 8;
         ensure!(
             bits >= 8 * 32,
             "the video is too small to carry a stealth data layer"
@@ -90,6 +105,7 @@ impl Geometry {
             width,
             height,
             block,
+            symbol_bits,
             columns,
             rows,
             pairs,
@@ -152,13 +168,26 @@ fn fill_block(image: &mut [u8], block: usize, width: usize, x0: usize, y0: usize
     }
 }
 
+/// Per-pixel difference between a pair's outer modulation levels. The four
+/// levels sit at ±(LEVEL_RANGE/3)/2 and ±(LEVEL_RANGE)/2 around the pair
+/// mean, so the outer levels hit the same ±25-per-pixel swing the legacy
+/// binary layer used, and the two added inner levels halve the noise
+/// margin per symbol in exchange for double the data rate.
+const LEVEL_RANGE: i64 = 50;
+
+/// Sum distance between adjacent modulation levels for a block of `area`.
+fn level_step(area: i64) -> i64 {
+    area * LEVEL_RANGE / 3
+}
+
 /// Prepares one frame for encoding: clamps the background luma, stamps the
 /// anchor checkerboard onto the border blocks, and applies the pair
 /// modulation for `bits` (row-major, most significant bit first). Each pair
-/// is modulated around its own mean so a bit shifts both blocks in opposite
-/// directions by exactly `MODULATION` regardless of the background content;
-/// the decoder still just compares the block means. Data blocks past the
-/// end of `bits` keep the clamped background.
+/// is modulated around its own mean so a symbol shifts both blocks in
+/// opposite directions regardless of the background content; the decoder
+/// recovers the symbol from the block-mean difference. Quaternary layers
+/// carry two bits per pair across four luma levels; legacy layers one bit.
+/// Data blocks past the end of `bits` keep the clamped background.
 pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, bits: &[bool]) {
     let width = geometry.width;
     for value in &mut image[..width * geometry.height] {
@@ -181,37 +210,49 @@ pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, b
     }
     let area = (block * block) as i64;
     let step = area * i64::from(MODULATION);
-    for (index, &bit) in bits.iter().enumerate() {
-        let row = index / geometry.pairs;
-        let pair = index % geometry.pairs;
-        let col = ANCHOR_COLS + 2 * pair;
-        let x0 = col * block + dx;
-        let x1 = (col + 1) * block + dx;
-        let y0 = row * block + dy;
-        let sum_a = i64::try_from(block_sum(image, block, width, x0, y0)).unwrap_or(0);
-        let sum_b = i64::try_from(block_sum(image, block, width, x1, y0)).unwrap_or(0);
-        let middle = (sum_a + sum_b) / 2;
-        let (target_a, target_b) = if bit {
-            (middle + step, middle - step)
-        } else {
-            (middle - step, middle + step)
-        };
-        shift_towards(
-            image,
-            block,
-            width,
-            x0,
-            y0,
-            i32::try_from((target_a - sum_a) / area).unwrap_or(0),
-        );
-        shift_towards(
-            image,
-            block,
-            width,
-            x1,
-            y0,
-            i32::try_from((target_b - sum_b) / area).unwrap_or(0),
-        );
+    let level = level_step(area);
+    let symbols = bits.len() / geometry.symbol_bits;
+    for row in 0..geometry.rows {
+        for pair in 0..geometry.pairs {
+            let index = row * geometry.pairs + pair;
+            if index >= symbols {
+                continue;
+            }
+            let col = ANCHOR_COLS + 2 * pair;
+            let x0 = col * block + dx;
+            let x1 = (col + 1) * block + dx;
+            let y0 = row * block + dy;
+            let sum_a = i64::try_from(block_sum(image, block, width, x0, y0)).unwrap_or(0);
+            let sum_b = i64::try_from(block_sum(image, block, width, x1, y0)).unwrap_or(0);
+            let middle = (sum_a + sum_b) / 2;
+            let (target_a, target_b) = if geometry.symbol_bits == 1 {
+                if bits[index] {
+                    (middle + step, middle - step)
+                } else {
+                    (middle - step, middle + step)
+                }
+            } else {
+                let symbol = u64::from(bits[2 * index]) * 2 + u64::from(bits[2 * index + 1]);
+                let delta = (2 * symbol as i64 - 3) * level / 2;
+                (middle + delta, middle - delta)
+            };
+            shift_towards(
+                image,
+                block,
+                width,
+                x0,
+                y0,
+                i32::try_from((target_a - sum_a) / area).unwrap_or(0),
+            );
+            shift_towards(
+                image,
+                block,
+                width,
+                x1,
+                y0,
+                i32::try_from((target_b - sum_b) / area).unwrap_or(0),
+            );
+        }
     }
 }
 
@@ -318,22 +359,39 @@ pub fn find_alignment(y: &[u8], geometry: Geometry, raster: &mut Raster) -> Opti
     (score - runner_up > margin).then_some((dx, dy))
 }
 
-/// Demodulates `out.len()` bytes from a frame: a bit is one when the mean
-/// luma of the pair's first block is greater than the second block's.
-/// `raster.scan` must have run on the same `y` plane first.
+/// Demodulates `out.len()` bytes from a frame. Legacy layers carry one bit
+/// per pair (one when the first block's mean luma tops the second's);
+/// current layers quantise the block-mean difference into four levels that
+/// each stand for two bits. `raster.scan` must have run on the same `y`
+/// plane first.
 pub fn demodulate(geometry: Geometry, offset: (usize, usize), raster: &Raster, out: &mut [u8]) {
     let (dx, dy) = offset;
     let block = geometry.block;
+    let area = (block * block) as i64;
+    let level = level_step(area);
+    let carrier = geometry.pairs * geometry.symbol_bits;
     for (byte_index, byte) in out.iter_mut().enumerate() {
         let mut value = 0u8;
         for bit in 0..8 {
             let index = byte_index * 8 + bit;
-            let row = index / geometry.pairs;
-            let pair = index % geometry.pairs;
+            let row = index / carrier;
+            let within = index % carrier;
+            let pair = within / geometry.symbol_bits;
+            let sub = within % geometry.symbol_bits;
             let col = ANCHOR_COLS + 2 * pair;
             let a = raster.sum(col * block + dx, row * block + dy, block);
             let b = raster.sum((col + 1) * block + dx, row * block + dy, block);
-            if a > b {
+            let one = if geometry.symbol_bits == 1 {
+                a > b
+            } else {
+                // Nearest-level decision: the levels sit 2*level apart, so
+                // (diff + 4*level) / (2*level) rounds to the level index
+                // clamped to the four valid symbols.
+                let diff = a as i64 - b as i64;
+                let symbol = (diff + 4 * level).div_euclid(2 * level).clamp(0, 3);
+                (symbol as u8 >> (1 - sub)) & 1 == 1
+            };
+            if one {
                 value |= 1 << (7 - bit);
             }
         }
@@ -582,12 +640,14 @@ fn candidate_blocks(width: usize, height: usize) -> impl Iterator<Item = usize> 
 }
 
 impl<R: Read> Reader<R> {
-    /// Opens a stealth stream without knowing the encoder's block size:
-    /// every even candidate block that fits the resolution is demodulated
-    /// from the incoming frames until the sync marker, transport header and
-    /// the header's own block size all agree on one candidate. The default
-    /// block is probed first, then the faster smaller ones, then the sturdier
-    /// larger ones. Only the frames needed for detection are consumed.
+    /// Opens a stealth stream without knowing the encoder's block size or
+    /// modulation depth: every even candidate block that fits the resolution
+    /// is demodulated with the quaternary (two bits per pair) and the legacy
+    /// (one bit per pair) layers from the incoming frames until the sync
+    /// marker, transport header and the header's own block size all agree on
+    /// one candidate. The default block is probed first, then the faster
+    /// smaller ones, then the sturdier larger ones. Only the frames needed
+    /// for detection are consumed.
     pub(crate) fn open(mut pipe: R, width: usize, height: usize) -> Result<Self> {
         let luma = width * height;
         let mut image = vec![0; luma * 3 / 2];
@@ -598,23 +658,30 @@ impl<R: Read> Reader<R> {
         // Candidates that passed the sync-marker check, in probe order.
         let mut alive: Vec<(Geometry, (usize, usize), Vec<u8>)> = Vec::new();
         for block in candidate_blocks(width, height) {
-            let Ok(geometry) = Geometry::new(width, height, block) else {
+            let Ok(probe) = Geometry::new(width, height, block) else {
                 continue;
             };
-            let Some(at) = find_alignment(&image[..luma], geometry, &mut raster) else {
+            // The anchor checkerboard pins the alignment for every layer.
+            let Some(at) = find_alignment(&image[..luma], probe, &mut raster) else {
                 continue;
             };
-            let mut buffer = Vec::new();
-            demodulate(
-                geometry,
-                at,
-                &raster,
-                push_frame(&mut buffer, geometry.frame_bytes()),
-            );
-            if buffer[..MARKER.len()] != MARKER {
-                continue;
+            let mut variants = vec![probe];
+            if let Ok(geometry) = Geometry::legacy(width, height, block) {
+                variants.push(geometry);
             }
-            alive.push((geometry, at, buffer));
+            for geometry in variants {
+                let mut buffer = Vec::new();
+                demodulate(
+                    geometry,
+                    at,
+                    &raster,
+                    push_frame(&mut buffer, geometry.frame_bytes()),
+                );
+                if buffer[..MARKER.len()] != MARKER {
+                    continue;
+                }
+                alive.push((geometry, at, buffer));
+            }
         }
         // Feed every surviving candidate until one transport header both
         // parses and matches the probed geometry.
@@ -755,16 +822,23 @@ mod tests {
     #[test]
     fn geometry_matches_the_documented_capacities() {
         let full = Geometry::new(1920, 1080, super::BLOCK).unwrap();
-        assert_eq!(full.frame_bytes(), 3498);
+        assert_eq!(full.frame_bytes(), 6996);
         let small = Geometry::new(WIDTH, HEIGHT, super::BLOCK).unwrap();
-        assert_eq!(small.frame_bytes(), 47);
+        assert_eq!(small.frame_bytes(), 95);
         // Block 4 packs (6/4)^2 = 2.25x as many bit pairs into the same
         // frame; integer rounding gives 2.4x at this resolution.
         let dense = Geometry::new(WIDTH, HEIGHT, 4).unwrap();
-        assert_eq!(dense.frame_bytes(), 116);
+        assert_eq!(dense.frame_bytes(), 232);
         assert!(
             dense.bits_per_frame() * 4 > small.bits_per_frame() * 9,
             "block 4 must carry at least the documented 2.25x density"
+        );
+        // The legacy layer carries exactly half the bits per frame.
+        assert_eq!(
+            Geometry::legacy(WIDTH, HEIGHT, super::BLOCK)
+                .unwrap()
+                .frame_bytes(),
+            small.frame_bytes() / 2
         );
         assert!(Geometry::new(24, 12, super::BLOCK).is_err());
     }
@@ -779,6 +853,19 @@ mod tests {
 
     fn round_trip(block: usize) {
         let geometry = Geometry::new(WIDTH, HEIGHT, block).unwrap();
+        round_trip_with(geometry);
+    }
+
+    #[test]
+    fn legacy_layer_still_round_trips_one_bit_per_pair() {
+        // Videos encoded before the density increase still restore: the
+        // decoder probes the one-bit-per-pair layer beside the current one.
+        for block in [super::BLOCK, 4] {
+            round_trip_with(Geometry::legacy(WIDTH, HEIGHT, block).unwrap());
+        }
+    }
+
+    fn round_trip_with(geometry: Geometry) {
         let bits: Vec<bool> = (0..geometry.frame_bytes() * 8)
             .map(|i| (i % 7) % 2 == 0)
             .collect();
@@ -791,7 +878,14 @@ mod tests {
         let mut out = vec![0; geometry.frame_bytes()];
         demodulate(geometry, alignment.unwrap(), &raster, &mut out);
         for (index, &bit) in bits.iter().enumerate() {
-            assert_eq!(out[index / 8] >> (7 - index % 8) & 1 == 1, bit);
+            assert_eq!(
+                out[index / 8] >> (7 - index % 8) & 1 == 1,
+                bit,
+                "bit {index} (pair {}, digit {}) of block {}",
+                index / geometry.symbol_bits,
+                index % geometry.symbol_bits,
+                geometry.block
+            );
         }
         for &value in &image[..WIDTH * HEIGHT] {
             assert!(

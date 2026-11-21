@@ -132,20 +132,21 @@ With `--stealth <VIDEO>`, `encode` does not store cells at all. Instead it hides
 
 How it works:
 
-- The data layer only touches the **brightness (Y) channel**; the colours (U/V) of the background stay untouched. The frame is divided into rows of block pairs (6×6 pixels each by default); each pair stores one bit by shifting the pair's mean luma towards one block or the other (±25/255, about 10% brightness). Base values are clamped to 30–225 and the shift is applied around the pair's mean, so the bit survives strong background gradients and re-encoding (tested through CRF 18, the default).
+- The data layer only touches the **brightness (Y) channel**; the colours (U/V) of the background stay untouched. The frame is divided into rows of block pairs (6×6 pixels each by default); each pair stores **two bits** by shifting the pair's mean luma into one of four levels (±12.5 and ±37.5 brightness units around the pair's own mean, about 5–15% contrast). Base values are clamped to 30–225 and the shift is applied around the pair's mean, so the symbols survive strong background gradients and re-encoding (tested through CRF 18, the default).
 - A checkerboard anchor pattern along the frame edges lets the decoder align the grid even after scaling or a few dropped frames.
 - The background video is looped (`-stream_loop -1`) for both picture and audio as long as data remains, and its audio is muxed into the output; `-shortest` ends the video with the last data frame.
-- Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each bit by comparing the mean luma of block A versus block B. The stealth block size is detected automatically too — no decoder-side flag is needed. You never need the background video again.
+- Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each pair by quantising the first block's mean luma minus the second's into the nearest of the four levels. The stealth block size and the layer depth are detected automatically too — no decoder-side flag is needed. You never need the background video again.
+- Videos encoded before the density increase (one bit per pair) still restore: the decoder probes the old binary layer beside the current one.
 - Because re-encoded guerrilla data (streaming platforms use VP9/AV1) demands extra robustness, stealth defaults to 96 Reed-Solomon parity symbols per codeword (~38% redundancy) and CRF 18.
 - Dimensions default to the background video's resolution rounded down to a multiple of the block size; `--width`, `--height`, `--fps`, `--crf`, `--preset`, `--ecc-symbols`, `--intra` and their config-file equivalents override the defaults as usual.
 
-Speed: every bit costs two blocks of pixels, so the block size directly sets the throughput. The default 6 favours robustness; `--stealth-block 4` carries 2.25x as much per frame, and `--stealth-block 2` up to 9x as much. Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; encode wall time is typically a fraction of it on GPU-capable machines, decode the same again):
+Speed: every block pair carries two bits, so the block size directly sets the throughput. The default 6 favours robustness; `--stealth-block 4` carries 2.25x as much per frame, and `--stealth-block 2` up to 9x as much. Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; encode wall time is typically a fraction of it on GPU-capable machines, decode the same again):
 
 | Block | Bytes/frame | Playback throughput | Video duration for 1 GiB |
 | --- | --- | --- | --- |
-| 6 (default) | 3,498 | 0.10 MB/s | ~2.8 hours |
-| 4 | 7,946 | 0.24 MB/s | ~1.3 hours |
-| 2 | 32,093 | 0.96 MB/s | ~19 minutes |
+| 6 (default) | 6,996 | 0.21 MB/s | ~1.4 hours |
+| 4 | 15,892 | 0.48 MB/s | ~38 minutes |
+| 2 | 64,186 | 1.93 MB/s | ~9 minutes |
 
 Other levers, measured on a 1278×720 CPU-only encode of 5 MiB (your numbers vary by machine — the GPU encoder is otherwise idle and leaves the CPU to the error correction):
 
@@ -167,7 +168,7 @@ Limitations:
 - A `--chroma` request (explicit flag or config default) is ignored with a warning: the chroma planes carry the background colours. An `--optimise` target (explicit flag or config default) does apply to stealth: the calibrated encoder backend and all-intra choice are used, only its chroma part never is. The profiles were measured on the cell format, so the choice is a hardware-level hint for stealth encodes rather than an exact stealth measurement; a warning says as much, and a `chroma = on` / `optimise = ...` config tuned for cell encodes never blocks a stealth encode.
 - `estimate` and `benchmark` have no stealth support; use them in normal mode only.
 - The 8-byte sync marker and the transport header are outside the Reed-Solomon protection. If the opening frames of the video are damaged so badly that anchors or header cannot be parsed, decoding stops; the file payload itself enjoys the full parity budget.
-- Capacity per frame is much lower than the cell format (a 1920×1080 frame holds ~3.5 KB instead of ~130 KB), so the same file takes far more playback duration in stealth mode — this mode trades capacity for invisibility.
+- Capacity per frame is much lower than the cell format (a 1920×1080 frame holds ~7 KB instead of ~130 KB), so the same file takes far more playback duration in stealth mode — this mode trades capacity for invisibility.
 
 ### `decode <INPUT> <OUTPUT>`
 
