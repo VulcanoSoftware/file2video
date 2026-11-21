@@ -3,7 +3,7 @@
 //! `key = value` lines; `#` or `;` start comments. Every key is optional and
 //! explicit command-line options always win over values from this file.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
 use std::path::Path;
 
@@ -48,6 +48,9 @@ pub struct Config {
     pub intra: Option<bool>,
     pub gpu: Option<Gpu>,
     pub optimise: Option<Target>,
+    pub stealth_intensity: Option<usize>,
+    pub stealth_block: Option<usize>,
+    pub stealth_dense: Option<bool>,
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -130,6 +133,25 @@ impl Config {
                 "chroma" => {
                     config.chroma = Some(parse_bool(value).with_context(|| which().clone())?);
                 }
+                "stealth_intensity" => {
+                    let parsed = parse_number(value)?;
+                    contains(parsed, 5..=50).with_context(|| which().clone())?;
+                    config.stealth_intensity = Some(parsed as usize);
+                }
+                "stealth_block" => {
+                    let parsed = parse_number(value)?;
+                    contains(parsed, 2..=16).with_context(|| which().clone())?;
+                    ensure!(
+                        parsed % 2 == 0,
+                        "{}: stealth_block must be an even number of pixels",
+                        which()
+                    );
+                    config.stealth_block = Some(parsed as usize);
+                }
+                "stealth_dense" => {
+                    config.stealth_dense =
+                        Some(parse_bool(value).with_context(|| which().clone())?);
+                }
                 "intra" => {
                     config.intra = Some(parse_bool(value).with_context(|| which().clone())?);
                 }
@@ -210,6 +232,9 @@ mod tests {
             intra = yes
             gpu = amf
             optimise = balanced
+            stealth_intensity = 40
+            stealth_dense = on
+            stealth_block = 6
         ";
         let config = Config::from_text(text, "file2video.conf").unwrap();
         assert_eq!(config.width, Some(1280));
@@ -226,6 +251,9 @@ mod tests {
         assert_eq!(config.intra, Some(true));
         assert_eq!(config.gpu, Some(Gpu::Amf));
         assert_eq!(config.optimise, Some(Target::Balanced));
+        assert_eq!(config.stealth_intensity, Some(40));
+        assert_eq!(config.stealth_dense, Some(true));
+        assert_eq!(config.stealth_block, Some(6));
     }
 
     #[test]
@@ -238,6 +266,11 @@ mod tests {
         assert!(Config::from_text("gpu = dxva\n", "f").is_err());
         assert!(Config::from_text("optimise = tiny\n", "f").is_err());
         assert!(Config::from_text("preset = warp\n", "f").is_err());
+        assert!(Config::from_text("stealth_intensity = 4\n", "f").is_err());
+        assert!(Config::from_text("stealth_intensity = 51\n", "f").is_err());
+        assert!(Config::from_text("stealth_dense = maybe\n", "f").is_err());
+        assert!(Config::from_text("stealth_block = 5\n", "f").is_err());
+        assert!(Config::from_text("stealth_block = 18\n", "f").is_err());
         let config = Config::from_text("optimise = off\nchroma = 0\n", "f").unwrap();
         assert_eq!(config.optimise, Some(Target::Off));
         assert_eq!(config.chroma, Some(false));

@@ -48,8 +48,9 @@
   <p class="lead">Build a <code>file2video.conf</code> file for the <code>file2video</code> CLI.
   Drop it in the directory where you run the program (or pass <code>--config &lt;PATH&gt;</code>) and every
   value below becomes a default for <code>encode</code>, <code>decode</code>, <code>estimate</code> and
-  <code>benchmark</code>. Command-line flags always override this file. Encrypting with a password is
-  always on; everything here is optional tuning.</p>
+  <code>benchmark</code>. Command-line flags always override this file. Encode with
+  <code>--no-password</code> to skip encryption, or enter a password when asked; everything here is
+  optional tuning.</p>
 </header>
 
 <div class="layout">
@@ -126,6 +127,25 @@
       </div>
     </div>
 
+    <h2 style="margin-top:1.6rem">Stealth mode</h2>
+    <p class="hint" style="margin:.2rem 0 .8rem">Defaults for
+      <code>encode --stealth &lt;background.mp4&gt;</code>, which hides the file as a faint luma layer
+      over a background video you provide. Decoding is blind, so none of these matter on decode.</p>
+    <div class="row">
+      <div>
+        <label for="stealth_intensity"><b>stealth_intensity</b> — data layer visibility (luma levels, 5–50)</label>
+        <input type="number" id="stealth_intensity" placeholder="25" min="5" max="50" step="1">
+      </div>
+      <div>
+        <label for="stealth_block"><b>stealth_block</b> — modulation block size (even px, 2–16)</label>
+        <input type="number" id="stealth_block" placeholder="4" min="2" max="16" step="2">
+      </div>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="stealth_dense">
+      <span><b>stealth_dense</b> — double the stealth data rate: sixteen modulation levels (four bits per block pair) instead of four; pair with intensity 40+ for aggressive platforms such as YouTube</span>
+    </div>
+
     <h2 style="margin-top:1.6rem">Hardware</h2>
     <div class="row">
       <div>
@@ -179,7 +199,8 @@
 
 <script>
   const FIELDS = ["width", "height", "block_size", "fps", "compress", "crf", "preset",
-    "ecc_symbols", "pbkdf2_iterations", "threads", "chroma", "intra", "gpu", "optimise"];
+    "ecc_symbols", "pbkdf2_iterations", "threads", "chroma", "intra", "gpu", "optimise",
+    "stealth_intensity", "stealth_block", "stealth_dense"];
 
   const el = (id) => document.getElementById(id);
 

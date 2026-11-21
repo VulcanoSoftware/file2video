@@ -83,6 +83,8 @@ Encrypts `INPUT` and writes the video to `OUTPUT`. `OUTPUT` must not exist yet.
 | `--optimise <TARGET>` | off | Pick the best measured backend and frame mode for this machine: `smallest`, `fastest` or `balanced`. See [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). In stealth mode only the backend and all-intra choice apply. |
 | `--stealth <VIDEO>` | off | Hide the data as a faint luma layer over a background video instead of storing cells; decoding is blind and does not need that video again. See [Stealth mode](#stealth-mode). |
 | `--stealth-block <PIXELS>` | `4` | Stealth mode only: modulation block size (even, 2–16). Smaller blocks carry more data per frame and encode proportionally faster; the default 4 brings a stealth encode close to a normal encode's wall time. Use 6 for maximum robustness against aggressive re-encoding. See [Stealth mode](#stealth-mode). |
+| `--stealth-intensity <LUMA>` | `25` | Stealth mode only: the data layer's outer luma level (5–50). The modulation levels sit at ±this value around the pair's mean. Higher values make the layer a little more visible but survive aggressive re-encoding (YouTube, streaming platforms) much better; for dense mode use 40–50. See [Stealth mode](#stealth-mode). |
+| `--stealth-dense` | off | Stealth mode only: double the data rate — sixteen modulation levels (four bits per block pair) over the same luma span instead of four levels (two bits). The level spacing narrows, so pair it with a higher `--stealth-intensity` (40+) for aggressive distribution channels. See [Stealth mode](#stealth-mode). |
 
 `--compress` sets preset and parity together: `light` = `slow` / 64, `medium` = `slower` / 32, `high` = `veryslow` / 16; CRF stays capped at 8 (6 with `--intra`). Explicit `--crf`, `--preset`, `--chroma`, `--intra` and `--ecc-symbols` override the profile. These profiles reduce the error-correction margin.
 
@@ -132,19 +134,21 @@ With `--stealth <VIDEO>`, `encode` does not store cells at all. Instead it hides
 
 How it works:
 
-- The data layer only touches the **brightness (Y) channel**; the colours (U/V) of the background stay untouched. The frame is divided into rows of block pairs (6×6 pixels each by default); each pair stores **two bits** by shifting the pair's mean luma into one of four levels (±12.5 and ±37.5 brightness units around the pair's own mean, about 5–15% contrast). Base values are clamped to 30–225 and the shift is applied around the pair's mean, so the symbols survive strong background gradients and re-encoding (tested through CRF 18, the default).
+- The data layer only touches the **brightness (Y) channel**; the colours (U/V) of the background stay untouched. The frame is divided into rows of block pairs (4×4 pixels each by default, `--stealth-block`); each pair stores a **symbol of `--stealth-dense`-dependent depth** — two bits (four levels) by default, four bits (sixteen levels) with `--stealth-dense` — by shifting the pair's mean luma into one of evenly spaced levels spanning ±`--stealth-intensity` around the pair's own mean. Base values are clamped to 30–225, each block's pixel sum is met exactly, and the shift is applied around the pair's mean, so the symbols survive strong background gradients and re-encoding (tested through CRF 18, the default).
+- The layer's `--stealth-intensity` (default 25 luma levels) is the visibility/robustness dial: the level spacing is `2 × intensity / (levels − 1)` brightness units, so a higher intensity makes encoding more visible but resists aggressive platform re-encoding far better. The decoder **measures** the intensity from the anchor contrast, so encoded and decoded intensity never need to match by hand.
 - A checkerboard anchor pattern along the frame edges lets the decoder align the grid even after scaling or a few dropped frames.
 - The background video is looped (`-stream_loop -1`) for both picture and audio as long as data remains, and its audio is muxed into the output; `-shortest` ends the video with the last data frame.
-- Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each pair by quantising the first block's mean luma minus the second's into the nearest of the four levels. The stealth block size and the layer depth are detected automatically too — no decoder-side flag is needed. You never need the background video again.
+- Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each pair by quantising the first block's mean luma minus the second's into the nearest of the modulation levels. The stealth block size, the layer depth (default or dense) and the intensity are all detected automatically — no decoder-side flag is needed. You never need the background video again.
 - Videos encoded before the density increase (one bit per pair) still restore: the decoder probes the old binary layer beside the current one.
 - Because re-encoded guerrilla data (streaming platforms use VP9/AV1) demands extra robustness, stealth defaults to 96 Reed-Solomon parity symbols per codeword (~38% redundancy) and CRF 18.
 - Dimensions default to the background video's resolution rounded down to a multiple of the block size; `--width`, `--height`, `--fps`, `--crf`, `--preset`, `--ecc-symbols`, `--intra` and their config-file equivalents override the defaults as usual.
 
-Speed: every block pair carries two bits, so the block size directly sets the throughput. The default 4 is the speed lever that makes the stealth pipeline roughly as fast as a normal encode on most machines; `--stealth-block 2` carries 4x as much per frame again, while `--stealth-block 6` trades throughput for maximum robustness against aggressive re-encoding (YouTube, streaming platforms). Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; on the default block 4 the encode wall time is comparable to a normal cell-format encode, decode the same again):
+Speed: every block pair carries two bits (four with `--stealth-dense`), so the block size directly sets the throughput. The default 4 is the speed lever that makes the stealth pipeline roughly as fast as a normal encode on most machines; `--stealth-dense` doubles the payload over the same frames, `--stealth-block 2` carries 4x as much per frame again, while `--stealth-block 6` trades throughput for maximum robustness against aggressive re-encoding (YouTube, streaming platforms). Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; on the default block 4 the encode wall time is comparable to a normal cell-format encode, decode the same again):
 
 | Block | Bytes/frame | Playback throughput | Video duration for 1 GiB |
 | --- | --- | --- | --- |
 | 4 (default) | 15,892 | 0.48 MB/s | ~38 minutes |
+| 4 dense | 31,787 | 0.93 MB/s | ~19 minutes |
 | 6 (robustness) | 6,996 | 0.21 MB/s | ~1.4 hours |
 | 2 (fastest) | 64,186 | 1.93 MB/s | ~9 minutes |
 
@@ -162,6 +166,12 @@ Example: encode a 1 GiB archive as a stealth layer at the maximum-robustness set
 ```sh
 ./file2video encode backup.zip hidden.mp4 --stealth gameplay.mp4 --stealth-block 6 --password s3cret
 ```
+
+Visibility and robustness: the `--stealth-intensity` dial (5–50, default 25) sets how far the levels stray from the pair's mean brightness. A low value hides the layer better, but the level spacing shrinks with it — at the maximum depth (dense) the spacing is only `2 × intensity / 15` brightness units, which survives YouTube-grade re-encoding only with intensity 40–50. Rules of thumb:
+
+- Stealth over aggressive channels (YouTube, upload + platform re-encode): keep `--stealth-dense --stealth-intensity 40` or higher (or trade density back: default depth at intensity 25 has a much wider spacing).
+- Direct file transfer or gentle re-encoding: lower intensities (5–15) make the layer nearly invisible and still restore.
+- The layer's visibility is proportional to the intensity; some visible fine noise over the footage is expected and harmless at higher settings.
 
 Limitations:
 
@@ -227,6 +237,9 @@ Maintainers: the page deploys automatically on every push to `main` that touches
 | `threads` | 0–256 (0) | Thread limit; 0 = automatic. |
 | `gpu` | `auto`, `off`, `amf`, `nvenc`, `qsv`, `vaapi`, `video-toolbox` (auto) | Hardware encoder choice. |
 | `optimise` | `off`, `smallest`, `fastest`, `balanced` (off) | Use the saved calibration, see above. |
+| `stealth_intensity` | 5–50 (25) | Stealth mode only: the data layer's outer luma level, see [Stealth mode](#stealth-mode). |
+| `stealth_block` | even 2–16 (4) | Stealth mode only: modulation block size in pixels. |
+| `stealth_dense` | `on`/`off` (off) | Stealth mode only: four modulation bits per block pair instead of two. |
 
 Example:
 
@@ -239,6 +252,8 @@ gpu = auto
 pbkdf2_iterations = 600000
 # chroma = on
 # intra = off
+# stealth_intensity = 40
+# stealth_dense = on
 ```
 
 The calibration database has its own file, `file2video-calibration.conf`, also in the working directory by default; move it with `--calibration <PATH>`. Neither file contains secrets.
