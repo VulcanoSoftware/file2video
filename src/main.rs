@@ -649,7 +649,11 @@ fn encode_stealth(
         .clone()
         .or_else(|| ctx.config.preset.clone())
         .unwrap_or_else(|| "faster".to_owned());
-    let parity = usize::from(options.ecc_symbols.or(ctx.config.ecc_symbols).unwrap_or(96));
+    // Stealth defaults to 64 Reed-Solomon parity symbols: the extra symbols
+    // of the older 96 default never earned their keep in measured round
+    // trips (a re-encoded dense layer fails both settings), while they cost
+    // ~25% more frames and output size.
+    let parity = usize::from(options.ecc_symbols.or(ctx.config.ecc_symbols).unwrap_or(64));
     let iterations = options
         .pbkdf2_iterations
         .or(ctx.config.pbkdf2_iterations)
@@ -689,6 +693,24 @@ fn encode_stealth(
             if symbol_bits == 4 { ", dense" } else { "" },
             fps
         );
+        // The data layer hides near-random noise, so the MP4 runs at a
+        // multiple of the payload; the level spacing decides how much
+        // compression noise it survives. Measured restore boundaries: a
+        // spacing of ~3.3 luma levels (dense, intensity 25) restores up to
+        // about CRF 17 and ~6.7 levels up to about CRF 20; each doubling of
+        // the spacing buys roughly 3.5 CRF more.
+        let step_luma = 2.0 * f64::from(intensity) / ((1usize << symbol_bits) - 1) as f64;
+        let safe_crf = (17.0 + 3.5 * (step_luma / 3.33).log2()) as u8;
+        if crf > safe_crf {
+            eprintln!(
+                "Warning: with {symbol_bits} bits per pair at intensity {intensity} the level spacing is {step_luma:.1} luma levels; CRF {crf} is usually too lossy to restore reliably. Use --crf {safe_crf} or lower, a higher --stealth-intensity, or drop --stealth-dense."
+            );
+        }
+        if parity > 64 {
+            eprintln!(
+                "Note: the stealth MP4 goes several times larger than the payload; {parity} parity symbols add ~1% stream size per symbol over the 64 default -- lower --stealth-intensity too if size matters."
+            );
+        }
     }
     let crypto_header = header.bytes();
     let mut stream = crypto_header.as_slice().chain(&mut staged);

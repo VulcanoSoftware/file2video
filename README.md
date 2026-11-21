@@ -140,7 +140,7 @@ How it works:
 - The background video is looped (`-stream_loop -1`) for both picture and audio as long as data remains, and its audio is muxed into the output; `-shortest` ends the video with the last data frame.
 - Decoding is **blind**: `decode` detects a stealth video automatically (it first tries the normal format, then falls back to the stealth decoder), aligns on the anchors, and reads each pair by quantising the first block's mean luma minus the second's into the nearest of the modulation levels. The stealth block size, the layer depth (default or dense) and the intensity are all detected automatically — no decoder-side flag is needed. You never need the background video again.
 - Videos encoded before the density increase (one bit per pair) still restore: the decoder probes the old binary layer beside the current one.
-- Because re-encoded guerrilla data (streaming platforms use VP9/AV1) demands extra robustness, stealth defaults to 96 Reed-Solomon parity symbols per codeword (~38% redundancy) and CRF 18.
+- Because re-encoded guerrilla data (streaming platforms use VP9/AV1) demands extra robustness, stealth defaults to 64 Reed-Solomon parity symbols per codeword (25% redundancy) and CRF 18; measured sandbox round trips showed the older 96-symbol default never rescued a re-encoded dense layer but cost ~25% more frames and output size. Raise `--ecc-symbols` yourself (up to 127) if you accept the size for extra margin.
 - Dimensions default to the background video's resolution rounded down to a multiple of the block size; `--width`, `--height`, `--fps`, `--crf`, `--preset`, `--ecc-symbols`, `--intra` and their config-file equivalents override the defaults as usual.
 
 Speed: every block pair carries two bits (four with `--stealth-dense`), so the block size directly sets the throughput. The default 4 is the speed lever that makes the stealth pipeline roughly as fast as a normal encode on most machines; `--stealth-dense` doubles the payload over the same frames, `--stealth-block 2` carries 4x as much per frame again, while `--stealth-block 6` trades throughput for maximum robustness against aggressive re-encoding (YouTube, streaming platforms). Capacities at 1920×1080 and 30 fps (the video duration a 1 GiB file needs; on the default block 4 the encode wall time is comparable to a normal cell-format encode, decode the same again):
@@ -151,6 +151,16 @@ Speed: every block pair carries two bits (four with `--stealth-dense`), so the b
 | 4 dense | 31,787 | 0.93 MB/s | ~19 minutes |
 | 6 (robustness) | 6,996 | 0.21 MB/s | ~1.4 hours |
 | 2 (fastest) | 64,186 | 1.93 MB/s | ~9 minutes |
+
+Output size: the data layer hides near-random noise, so the stealth MP4 goes several times larger than the payload — that is format-inherent (every restored byte needs hidden noise entropy, and lower intensity or more frames do not shrink the total noise volume). Measured at 720p, block 4, dense, intensity 50, 1 MiB payload, x264 ultrafast:
+
+| Settings | MP4 size relative to payload |
+| --- | --- |
+| CRF 16, 64 parity (the new default balance) | ~6x |
+| CRF 18, 96 parity (the old default) | ~7x |
+| CRF 22 or higher at dense intensity 25–50 | restore **fails** — do not use |
+
+If you need ~1.1x size instead and do not need camouflage, the regular cell format stores the same file far smaller; if the MP4 must stay small use `--crf 14-16`, avoid raising `--stealth-intensity` (50 ≈ +15% over 25) and keep `--ecc-symbols` at 64.
 
 Other levers, measured on a 1278×720 CPU-only encode of 5 MiB (your numbers vary by machine — the GPU encoder is otherwise idle and leaves the CPU to the error correction):
 
