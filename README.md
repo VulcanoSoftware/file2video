@@ -228,7 +228,7 @@ Most settings become defaults in an optional configuration file instead of long 
 
 Values in the file are defaults: every command-line flag you pass overrides it. Unknown values are rejected with the file name and line number, so mistakes are easy to find.
 
-Don't want to edit text files? The [config generator](https://vulcanosoftware.github.io/file2video/) builds this file in your browser — pick your values, copy the result, done. It is a static page served from [docs/index.html](docs/index.html).
+Don't want to edit text files? The [config generator](https://vulcanosoftware.github.io/file2video/) builds this file in your browser — pick your values, copy the result, done. Its **command builder** tab goes one step further: priority sliders (size, speed, re-encode robustness), every CLI flag as a form control with automatic incompatibility handling, and a client-side estimator that computes exact frame counts, playback duration and a measured-size-based MP4 size estimate from a source file and background video you pick locally (no uploads).
 
 Maintainers: the page deploys automatically on every push to `main` that touches `docs/` ([pages.yml](.github/workflows/pages.yml)). GitHub does not let the workflow's own token create a Pages site, so before the first deploy, enable Pages once: **Settings → Pages → Build and deployment → Source: GitHub Actions**, then re-run the workflow from the Actions tab.
 

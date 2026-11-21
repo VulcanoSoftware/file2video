@@ -46,6 +46,38 @@
   button.copied { background: var(--ok); }
   .note { border-left: 3px solid var(--warn); background: rgba(210,153,34,.08); padding: .6rem .9rem; font-size: .83rem; color: var(--muted); border-radius: 0 6px 6px 0; margin-top: 1rem; line-height: 1.45; }
   code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: .05rem .3rem; font-size: .8rem; }
+  /* ---- Tabs ---- */
+  .tabs { max-width: 1100px; margin: 0 auto 1.5rem; display: flex; gap: .5rem; }
+  .tabs button { background: transparent; color: var(--muted); border: 1px solid var(--border); font-size: .95rem; }
+  .tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .tab[hidden] { display: none; }
+  /* ---- Command builder ---- */
+  .builder-grid { max-width: 1100px; margin: 0 auto; display: grid; gap: 1.5rem; grid-template-columns: 1fr 1fr; align-items: start; }
+  @media (max-width: 860px) { .builder-grid { grid-template-columns: 1fr; } }
+  .full { grid-column: 1 / -1; }
+  .slider-row { display: grid; grid-template-columns: 11rem 1fr 2rem; align-items: center; gap: .75rem; margin: .55rem 0; }
+  .slider-row label { margin: 0; }
+  .slider-row output { font-family: ui-monospace, monospace; text-align: right; font-size: .85rem; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .chips { display: flex; flex-wrap: wrap; gap: .4rem; margin: .6rem 0; }
+  .chip { border: 1px solid var(--border); border-radius: 999px; padding: .15rem .65rem; background: var(--bg); font-family: ui-monospace, monospace; font-size: .78rem; }
+  .estimate { display: grid; grid-template-columns: auto 1fr; gap: .25rem 1rem; font-size: .85rem; margin: 0; }
+  .estimate dt { color: var(--muted); }
+  .estimate dd { margin: 0; font-family: ui-monospace, monospace; }
+  .estimate dd.warn-value { color: var(--warn); }
+  #b-warnings { display: none; margin-top: 1rem; }
+  #b-warnings.visible { display: block; }
+  #b-warnings p { margin: .35rem 0; }
+  #b-warnings .bad { color: #f85149; }
+  #toasts { position: fixed; right: 1rem; bottom: 1rem; display: flex; flex-direction: column; gap: .5rem; z-index: 50; max-width: 27rem; }
+  .toast { background: #6e1220; border: 1px solid #f85149; border-radius: 8px; padding: .7rem .9rem; font-size: .83rem; line-height: 1.45; box-shadow: 0 8px 24px rgba(0,0,0,.5); cursor: pointer; }
+  .toast b { display: block; margin-bottom: .15rem; }
+  fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 1rem 0 0; padding: .4rem 1rem 1rem; }
+  legend { color: var(--muted); font-size: .85rem; padding: 0 .4rem; }
+  .flags { display: grid; gap: 0 2rem; grid-template-columns: 1fr 1fr; }
+  @media (max-width: 860px) { .flags { grid-template-columns: 1fr; } }
+  select:disabled, input:disabled { opacity: .45; }
+  #b-command { min-height: 170px; white-space: pre; }
 </style>
 </head>
 <body>
@@ -60,6 +92,12 @@
   optional tuning.</p>
 </header>
 
+<nav class="tabs" aria-label="pages">
+  <button id="tabbtn-config" class="active" type="button">config generator</button>
+  <button id="tabbtn-builder" type="button">command builder</button>
+</nav>
+
+<div id="tab-config" class="tab">
 <div class="import-wrap">
   <section class="panel">
     <h2>Import an existing <code>file2video.conf</code></h2>
@@ -229,6 +267,230 @@ fps = 30
       hardware changes.
     </p>
   </section>
+</div>
+</div>
+
+<div id="tab-builder" class="tab" hidden>
+  <div class="builder-grid">
+    <section class="panel">
+      <h2>Priorities</h2>
+      <p class="hint" style="margin-top:0">Slide what matters to you; the builder proposes fitting flags
+        in the advice panel and you can still tune every argument yourself below. None of the files you
+        pick here leave your browser &#8212; all estimation is client-side JavaScript.</p>
+      <div class="slider-row">
+        <label for="b-priority-size"><b>Small file size</b></label>
+        <input type="range" id="b-priority-size" min="0" max="10" step="1" value="5">
+        <output id="b-priority-size-out">5</output>
+      </div>
+      <div class="slider-row">
+        <label for="b-priority-speed"><b>Fast encode + decode</b></label>
+        <input type="range" id="b-priority-speed" min="0" max="10" step="1" value="5">
+        <output id="b-priority-speed-out">5</output>
+      </div>
+      <div class="slider-row">
+        <label for="b-priority-robust"><b>Re-encode / error robustness</b></label>
+        <input type="range" id="b-priority-robust" min="0" max="10" step="1" value="5">
+        <output id="b-priority-robust-out">5</output>
+      </div>
+      <label for="b-stealth-toggle"><b>Stealth mode &#8212; hide the file in a background video?</b></label>
+      <select id="b-stealth-toggle">
+        <option value="off">no &#8212; regular cell format (smallest, most robust)</option>
+        <option value="on">yes &#8212; stealth layer over a background video</option>
+      </select>
+      <p class="hint">Stealth camouflages the data as faint luma noise over footage you provide, but the
+        MP4 ends up several times larger than the payload and survives aggressive re-encoding less well.</p>
+
+      <h2 style="margin-top:1.6rem">Your files (never uploaded)</h2>
+      <label for="b-source-file"><b>Source file to encode</b></label>
+      <input type="file" id="b-source-file">
+      <p class="hint" id="b-source-info">No file chosen &#8212; you can also just type the size below.</p>
+      <div class="row">
+        <div>
+          <label for="b-source-size"><b>or source file size (bytes)</b></label>
+          <input type="number" id="b-source-size" placeholder="1073741824" min="1" step="1">
+        </div>
+        <div>
+          <label for="b-source-name"><b>or source file name</b></label>
+          <input type="text" id="b-source-name" placeholder="movie.mkv" maxlength="4096">
+        </div>
+      </div>
+      <label for="b-output"><b>Output video</b></label>
+      <input type="text" id="b-output" placeholder="output.mp4">
+      <label for="b-bg-file"><b>Background video (only for stealth)</b></label>
+      <input type="file" id="b-bg-file" accept="video/*,.mp4,.mkv,.webm,.mov" disabled>
+      <p class="hint" id="b-bg-info">No background chosen &#8212; estimates then assume 1920×1080.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Advice for these priorities</h2>
+      <div class="chips" id="b-advice-chips"></div>
+      <p class="hint" id="b-advice-text"></p>
+      <div class="actions">
+        <button id="b-advice-apply" type="button">Apply the advice to the flags</button>
+      </div>
+
+      <h2 style="margin-top:1.6rem">Estimated result</h2>
+      <dl class="estimate" id="b-estimate"></dl>
+      <p class="hint">Lengths, frames, durations and the Reed-Solomon bookkeeping are computed exactly
+        like the Rust encoder does it. The MP4 file size is a measurement-based estimate, not a
+        promise: hardware encoders differ; budget &#177;25&#37;.</p>
+      <div class="note" id="b-warnings"></div>
+    </section>
+
+    <section class="panel full">
+      <h2>Every flag</h2>
+      <fieldset>
+        <legend>Video layout</legend>
+        <div class="flags">
+          <div>
+            <label for="b-width"><b>--width</b> + <b>--height</b> &#8212; nominal video resolution (px, even, leave both empty for the default)</label>
+            <div class="row">
+              <input type="number" id="b-width" placeholder="1920" min="2" step="2">
+              <input type="number" id="b-height" placeholder="1080" min="2" step="2">
+            </div>
+          </div>
+          <div>
+            <label for="b-block-size"><b>--block-size</b> &#8212; pixels per data cell (cell format only)</label>
+            <select id="b-block-size">
+              <option value="">(default: 8)</option>
+              <option>8</option><option>10</option><option>12</option><option>16</option><option>20</option>
+            </select>
+          </div>
+          <div>
+            <label for="b-fps"><b>--fps</b> &#8212; playback speed (1&#821160)</label>
+            <input type="number" id="b-fps" placeholder="30" min="1" max="60" step="1">
+          </div>
+          <div class="check">
+            <input type="checkbox" id="b-chroma">
+            <span><b>--chroma</b> &#8212; also use the U/V planes: +50&#37; capacity per frame, ~33&#37; fewer frames, same MP4 size</span>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="b-intra">
+            <span><b>--intra</b> &#8212; every frame a keyframe: better recovery margin, faster decode</span>
+          </div>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Quality &amp; speed</legend>
+        <div class="flags">
+          <div>
+            <label for="b-compress"><b>--compress</b> &#8212; profile preset (sets CRF/preset/parity defaults)</label>
+            <select id="b-compress">
+              <option value="">(default: medium)</option>
+              <option value="light">light &#8214; fast, extra recovery margin</option>
+              <option value="medium">medium &#8214; balanced</option>
+              <option value="high">high &#8214; smallest videos, tighter margin</option>
+            </select>
+          </div>
+          <div>
+            <label for="b-crf"><b>--crf</b> &#8212; x264 quality; cell format caps at 8, stealth defaults 18</label>
+            <input type="number" id="b-crf" placeholder="8" min="0" max="51" step="1">
+          </div>
+          <div>
+            <label for="b-preset"><b>--preset</b> &#8212; x264 speed/size preset (also the GPU quality tier)</label>
+            <select id="b-preset">
+              <option value="">(default: faster, or set by --compress)</option>
+              <option>ultrafast</option><option>superfast</option><option>veryfast</option>
+              <option>faster</option><option>fast</option><option>medium</option>
+              <option>slow</option><option>slower</option><option>veryslow</option>
+            </select>
+          </div>
+          <div>
+            <label for="b-ecc"><b>--ecc-symbols</b> &#8212; Reed-Solomon parity per 255-byte codeword (1&#8211127)</label>
+            <input type="number" id="b-ecc" placeholder="32" min="1" max="127" step="1">
+          </div>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Security</legend>
+        <div class="flags">
+          <div class="check">
+            <input type="checkbox" id="b-no-password">
+            <span><b>--no-password</b> &#8214; skip AES-GCM encryption; anyone with the video can read the file</span>
+          </div>
+          <div>
+            <label for="b-password"><b>--password</b> &#8212; set it in the command (visible in shell history!)</label>
+            <input type="password" id="b-password" autocomplete="off" placeholder="(otherwise asked interactively)">
+          </div>
+          <div>
+            <label for="b-password-file"><b>--password-file</b> &#8212; read the password from a UTF-8 text file</label>
+            <input type="text" id="b-password-file" placeholder="C:\secrets\pass.txt">
+          </div>
+          <div>
+            <label for="b-pbkdf2"><b>--pbkdf2-iterations</b> &#8212; KDF rounds (default 600000)</label>
+            <input type="number" id="b-pbkdf2" placeholder="600000" min="1" step="1">
+          </div>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Stealth (only with --stealth)</legend>
+        <div class="flags">
+          <div>
+            <label for="b-stealth"><b>--stealth</b> &#8212; background video path</label>
+            <input type="text" id="b-stealth" placeholder="background.mp4" disabled>
+          </div>
+          <div>
+            <label for="b-stealth-block"><b>--stealth-block</b> &#8212; modulation block in px (even, 2&#821116)</label>
+            <select id="b-stealth-block" disabled>
+              <option value="">(default: 4)</option>
+              <option>2</option><option>4</option><option>6</option><option>8</option>
+              <option>10</option><option>12</option><option>14</option><option>16</option>
+            </select>
+          </div>
+          <div>
+            <label for="b-stealth-intensity"><b>--stealth-intensity</b> &#8212; layer visibility (luma levels 5&#821150)</label>
+            <input type="number" id="b-stealth-intensity" placeholder="25" min="5" max="50" step="1" disabled>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="b-stealth-dense" disabled>
+            <span><b>--stealth-dense</b> &#8212; 16 levels (4 bits per pair) instead of 4: double the data rate, pair with intensity 40+</span>
+          </div>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Hardware</legend>
+        <div class="flags">
+          <div>
+            <label for="b-gpu"><b>--gpu</b> &#8212; hardware H.264 encoder</label>
+            <select id="b-gpu">
+              <option value="">(default: auto &#8212; trial-test the real GPUs of this machine)</option>
+              <option value="off">off &#8214; CPU encoder (libx264)</option>
+              <option value="amf">amf &#8214; AMD</option>
+              <option value="nvenc">nvenc &#8214; NVIDIA</option>
+              <option value="qsv">qsv &#8214; Intel</option>
+              <option value="vaapi">vaapi &#8214; Linux VAAPI</option>
+              <option value="video-toolbox">video-toolbox &#8214; macOS</option>
+            </select>
+          </div>
+          <div>
+            <label for="b-threads"><b>--threads</b> &#8212; thread limit, 0 = automatic</label>
+            <input type="number" id="b-threads" placeholder="0" min="0" max="256" step="1">
+          </div>
+          <div>
+            <label for="b-optimise"><b>--optimise</b> &#8212; pick the best measured encoding (cell format only)</label>
+            <select id="b-optimise">
+              <option value="">(default: off)</option>
+              <option value="smallest">smallest &#8214; minimum video file size</option>
+              <option value="fastest">fastest &#8214; minimum encode+decode time</option>
+              <option value="balanced">balanced &#8214; best combination of both</option>
+            </select>
+          </div>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="panel full">
+      <h2>Your command</h2>
+      <textarea id="b-command" readonly spellcheck="false"></textarea>
+      <div class="actions">
+        <button id="b-copy" type="button">Copy to clipboard</button>
+        <button id="b-to-config" type="button" class="secondary">Put these values into the config generator</button>
+      </div>
+      <p class="hint">Decoding never needs flags: <code>file2video decode output.mp4 original.bin</code>
+        detects the format (stealth included), asks for the password and restores the file byte for byte.</p>
+    </section>
+  </div>
+  <div id="toasts"></div>
 </div>
 
 <script>
@@ -408,5 +670,6 @@ fps = 30
 
   render();
 </script>
+<script src="builder.js"></script>
 </body>
 </html>
