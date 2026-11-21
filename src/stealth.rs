@@ -269,63 +269,121 @@ pub fn modulate_at(image: &mut [u8], geometry: Geometry, dx: usize, dy: usize, b
     }
 }
 
-fn block_sum(image: &[u8], block: usize, width: usize, x0: usize, y0: usize) -> u64 {
-    let mut sum = 0u64;
-    for y in y0..y0 + block {
-        sum += image[y * width + x0..y * width + x0 + block]
-            .iter()
-            .map(|&value| u64::from(value))
-            .sum::<u64>();
+/// Per-block scan results gathered in a single read pass: the pixel sum,
+/// the total headroom towards the fixed 30..=225 sample extremes, and the
+/// extremes themselves (with the run length of the maximum) that gate the
+/// uniform-share fast path of `set_block_sum`.
+#[derive(Clone, Copy)]
+struct BlockStats {
+    sum: i32,
+    head_down: i32,
+    head_up: i32,
+    min: i32,
+    max: i32,
+    max_count: i32,
+}
+
+impl BlockStats {
+    fn empty() -> Self {
+        Self {
+            sum: 0,
+            head_down: 0,
+            head_up: 0,
+            min: i32::MAX,
+            max: i32::MIN,
+            max_count: 0,
+        }
     }
-    sum
+
+    fn add(&mut self, value: u8) {
+        let v = i32::from(value);
+        self.sum += v;
+        self.head_down += v - 30;
+        self.head_up += 225 - v;
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+            self.max_count = 1;
+        } else if v == self.max {
+            self.max_count += 1;
+        }
+    }
 }
 
 /// Rewrites one block so its pixel sum hits `target` exactly. A uniform
 /// shift cannot always reach the target (individual pixels clamp against
 /// the fixed 30..=225 extremes long before the pair-mean correction is
 /// done), and the truncation loss of a uniform shift is up to `area` sum
-/// units - more than the dense layer's quantisation half-step. So the
-/// adjustment is spread pixel by pixel with suffix headroom bookkeeping:
-/// every pixel moves as far as needed while staying inside 30..=225, and
-/// the pair's mean-centring and level shift land exactly.
+/// units - more than the dense layer's quantisation half-step.
+///
+/// The common case shares the needed change evenly: every pixel takes the
+/// same step and the first `remaining % area` pixels take one extra unit,
+/// taken only when neither the shared step nor the run-up can clamp any
+/// pixel (the scan's min/max and max run length prove that). The rare
+/// clamping case falls back to pixel-by-pixel distribution with suffix
+/// headroom bookkeeping: every pixel moves as far as needed while staying
+/// inside 30..=225, and the pair's mean-centring and level shift land
+/// exactly.
 ///
 /// Feasibility is guaranteed: `base_range` clamps the background to
 /// [30+intensity, 225-intensity] and the modulation levels never ask for
 /// more than `intensity * area` of sum change, so the target always lies
 /// within the block's reachable 30*area..=225*area sum span.
-fn set_block_sum(image: &mut [u8], block: usize, width: usize, x0: usize, y0: usize, target: i64) {
-    let area = (block * block) as i64;
-    let target = target.clamp(30 * area, 225 * area);
-    let mut sum = 0i64;
-    let mut head_down = 0i64;
-    let mut head_up = 0i64;
-    for y in y0..y0 + block {
-        let start = y * width + x0;
-        for &value in &image[start..start + block] {
-            sum += i64::from(value);
-            head_down += i64::from(value - 30);
-            head_up += i64::from(225 - value);
-        }
+fn set_block_sum(
+    image: &mut [u8],
+    block: usize,
+    width: usize,
+    x0: usize,
+    y0: usize,
+    stats: BlockStats,
+    target: i64,
+) {
+    let area = (block * block) as i32;
+    let target = target.clamp(i64::from(30 * area), i64::from(225 * area)) as i32;
+    let remaining = target - stats.sum;
+    if remaining == 0 {
+        return;
     }
-    let mut remaining = target - sum;
-    debug_assert!((-head_down..=head_up).contains(&remaining));
+    let share = remaining.div_euclid(area);
+    let rest = remaining.rem_euclid(area);
+    let share_fits = stats.min + share >= 30 && stats.max + share <= 225;
+    let run_up_fits = rest == 0 || stats.max + share <= 224;
+    if share_fits && run_up_fits {
+        let mut extra = rest;
+        for y in y0..y0 + block {
+            let start = y * width + x0;
+            for value in &mut image[start..start + block] {
+                let mut v = i32::from(*value) + share;
+                if extra > 0 && v <= 224 {
+                    v += 1;
+                    extra -= 1;
+                }
+                *value = v as u8;
+            }
+        }
+        debug_assert_eq!(extra, 0, "the run-up must cover the whole remainder");
+        return;
+    }
+    let mut remaining = remaining;
     // Spread the needed change as an even per-pixel share, then give each
     // pixel the share it can actually take: the share is clamped to the
     // interval that still leaves the not-yet-visited pixels enough headroom
     // to absorb what is left, and to this pixel's own 30..=225 room.
-    let mut seen_down = 0i64;
-    let mut seen_up = 0i64;
+    let mut seen_down = 0i32;
+    let mut seen_up = 0i32;
     for y in y0..y0 + block {
         let start = y * width + x0;
         for (inner, value) in image[start..start + block].iter_mut().enumerate() {
             let position = (y - y0) * block + inner;
-            let (down, up) = (i64::from(*value - 30), i64::from(225 - *value));
-            let suffix_down = head_down - seen_down - down;
-            let suffix_up = head_up - seen_up - up;
-            let give = (remaining / (area - position as i64))
+            let (down, up) = (i32::from(*value) - 30, 225 - i32::from(*value));
+            let suffix_down = stats.head_down - seen_down - down;
+            let suffix_up = stats.head_up - seen_up - up;
+            let give = (remaining / (area - position as i32))
                 .clamp(remaining - suffix_up, remaining + suffix_down)
                 .clamp(-down, up);
-            *value = (*value as i64 + give) as u8;
+            *value = (*value as i32 + give) as u8;
             remaining -= give;
             seen_down += down;
             seen_up += up;
@@ -423,10 +481,22 @@ fn modulate_row_at(
         }
         let col = ANCHOR_COLS + 2 * pair;
         let x0 = col * block + dx;
+        // One scan over the pair's two adjacent blocks gathers both sums
+        // plus every headroom bookkeeping the write pass needs, replacing
+        // the older separate read passes per block.
+        let mut stats_a = BlockStats::empty();
+        let mut stats_b = BlockStats::empty();
+        for y in y0..y0 + block {
+            let row_pixels = &image[y * width + x0..y * width + x0 + 2 * block];
+            for &value in &row_pixels[..block] {
+                stats_a.add(value);
+            }
+            for &value in &row_pixels[block..] {
+                stats_b.add(value);
+            }
+        }
         let x1 = (col + 1) * block + dx;
-        let sum_a = i64::try_from(block_sum(image, block, width, x0, y0)).unwrap_or(0);
-        let sum_b = i64::try_from(block_sum(image, block, width, x1, y0)).unwrap_or(0);
-        let middle = (sum_a + sum_b) / 2;
+        let middle = i64::from((stats_a.sum + stats_b.sum) / 2);
         let (target_a, target_b) = if geometry.symbol_bits == 1 {
             if fetch_bit(bits, index) {
                 (middle + step, middle - step)
@@ -440,8 +510,8 @@ fn modulate_row_at(
             let delta = (2 * symbol as i64 - ((1i64 << geometry.symbol_bits) - 1)) * step / 2;
             (middle + delta, middle - delta)
         };
-        set_block_sum(image, block, width, x0, y0, target_a);
-        set_block_sum(image, block, width, x1, y0, target_b);
+        set_block_sum(image, block, width, x0, y0, stats_a, target_a);
+        set_block_sum(image, block, width, x1, y0, stats_b, target_b);
     }
 }
 
@@ -700,16 +770,7 @@ pub(crate) fn encode<R: Read>(
         .stdout(Stdio::null());
     let mut process = tools.spawn(cmd)?;
     let pipe = process.child.stdin.take().context("missing FFmpeg stdin")?;
-    let mut writer = Writer {
-        pipe,
-        bg_frames,
-        geometry,
-        image: vec![0; frame_len(geometry)],
-        pending: Vec::with_capacity(frame_len(geometry)),
-        progress: Progress::new("Encode", frames),
-        sent: 0,
-        bytes: 0,
-    };
+    let mut writer = Writer::start(pipe, bg_frames, geometry, Progress::new("Encode", frames));
     let outcome = (|| -> Result<u64> {
         let codec = ecc::Codec::new(settings.parity);
         writer.push(&MARKER)?;
@@ -789,64 +850,211 @@ impl Drop for BgFrames {
     }
 }
 
+/// A modulated frame waiting for the encoder pipe. `bits` counts the
+/// payload bytes the frame carries (the final frame may carry fewer).
+struct Frame {
+    image: Vec<u8>,
+    bits: usize,
+}
+
+/// Pipelined encoder feeder: a producer worker overlaps the modulation of
+/// the next frame with the FFmpeg encoder consuming the current one, while
+/// the writer thread only ships ready frames down the pipe. The producer's
+/// image buffers recycle through the `spares` channel, so steady state
+/// allocates nothing.
 struct Writer {
     pipe: ChildStdin,
-    bg_frames: BgFrames,
-    geometry: Geometry,
-    image: Vec<u8>,
-    /// Bytes waiting for a free frame; every full `frame_bytes` chunk
-    /// becomes one frame. Frame bit counts are multiples of eight, so frame
-    /// boundaries sit on byte boundaries and no bit-level bookkeeping is
-    /// needed while the payload arrives in byte chunks.
-    pending: Vec<u8>,
-    progress: Progress,
+    /// Payload chunks for the producer; dropping it ends the stream.
+    inbox: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// Ready frames back from the producer, bounded to keep at most a
+    /// couple of frames in flight.
+    frames: Option<std::sync::mpsc::Receiver<Frame>>,
+    /// Spent image buffers returned to the producer for reuse.
+    spares: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    failure: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
     sent: u64,
     bytes: u64,
 }
 
 impl Writer {
+    fn start(
+        pipe: ChildStdin,
+        bg_frames: BgFrames,
+        geometry: Geometry,
+        progress: Progress,
+    ) -> Self {
+        let (inbox, inbox_rx) = std::sync::mpsc::channel();
+        let (frame_tx, frames) = std::sync::mpsc::sync_channel(2);
+        let (spares_tx, spares) = std::sync::mpsc::channel();
+        let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let worker_failure = std::sync::Arc::clone(&failure);
+        let worker = std::thread::spawn(move || {
+            if let Err(error) =
+                write_frames(bg_frames, geometry, progress, inbox_rx, frame_tx, spares)
+            {
+                *worker_failure.lock().unwrap() = Some(error);
+            }
+        });
+        Self {
+            pipe,
+            inbox: Some(inbox),
+            frames: Some(frames),
+            spares: Some(spares_tx),
+            failure,
+            worker: Some(worker),
+            sent: 0,
+            bytes: 0,
+        }
+    }
+
+    fn check_failure(&self) -> Result<()> {
+        match self.failure.lock().unwrap().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn push(&mut self, data: &[u8]) -> Result<()> {
-        self.pending.extend_from_slice(data);
-        let frame_bytes = self.geometry.frame_bytes();
-        while self.pending.len() >= frame_bytes {
-            self.emit_frame()?;
+        self.check_failure()?;
+        if !data.is_empty() {
+            let inbox = self
+                .inbox
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("the stealth frame worker already stopped"))?;
+            if inbox.send(data.to_vec()).is_err() {
+                self.check_failure()?;
+                anyhow::bail!("the stealth frame worker stopped unexpectedly");
+            }
+        }
+        // Ship every frame that is already ready so the producer never runs
+        // further ahead than its bounded frame queue.
+        loop {
+            match self.frames.as_ref().expect("writer dropping").try_recv() {
+                Ok(frame) => self.write_frame(frame)?,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.check_failure()?;
+                    anyhow::bail!("the stealth frame worker stopped unexpectedly");
+                }
+            }
         }
         Ok(())
     }
 
-    /// Modulates the next frame's worth of pending bytes onto the
-    /// background image and writes it to the encoder.
-    fn emit_frame(&mut self) -> Result<()> {
-        self.bg_frames.load(&mut self.image)?;
-        // The very last frame may carry fewer bits: missing bits keep the
-        // clamped background, and rogue decoder output is caught by the
-        // strict stream length plus Reed-Solomon parity.
-        let frame_bytes = self.geometry.frame_bytes();
-        let used = frame_bytes.min(self.pending.len());
-        {
-            let bits = &self.pending[..used];
-            let image = self.image.as_mut_slice();
-            let geometry = self.geometry;
-            modulate(image, geometry, bits);
-        }
+    fn write_frame(&mut self, frame: Frame) -> Result<()> {
         self.pipe
-            .write_all(&self.image)
+            .write_all(&frame.image)
             .context("could not send a modulated frame to FFmpeg")?;
-        self.pending.drain(..used);
-        self.bytes += used as u64;
+        self.bytes += frame.bits as u64;
         self.sent += 1;
-        self.progress.update(self.sent, self.bytes);
+        if let Some(spares) = self.spares.as_ref() {
+            let _ = spares.send(frame.image);
+        }
         Ok(())
     }
 
-    /// Consumes the writer so the encoder's stdin is closed and FFmpeg
-    /// finalises the file, and returns the number of frames written.
+    /// Consumes the writer: closes the payload inbox (which ends the
+    /// producer's stream, final partial frame included), writes every
+    /// remaining ready frame, closes the encoder's stdin so FFmpeg finalises
+    /// the file, and returns the number of frames written.
     fn finish(mut self) -> Result<u64> {
-        if !self.pending.is_empty() {
-            self.emit_frame()?;
+        drop(self.inbox.take());
+        drop(self.spares.take());
+        let frames = self.frames.take();
+        if let Some(frames) = frames.as_ref() {
+            while let Ok(frame) = frames.recv() {
+                self.write_frame(frame)?;
+            }
         }
+        drop(frames);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.check_failure()?;
+        ensure!(self.sent >= 1, "no stealth frames were written");
         Ok(self.sent)
     }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Unblock the worker from both sides so a failed encode cannot
+        // leave a thread waiting on a channel nobody reads anymore.
+        drop(self.inbox.take());
+        drop(self.frames.take());
+        drop(self.spares.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// The producer side of the writer pipeline: modulates payload bytes onto
+/// background frames and hands the results to the writer thread.
+fn write_frames(
+    mut bg_frames: BgFrames,
+    geometry: Geometry,
+    mut progress: Progress,
+    inbox: std::sync::mpsc::Receiver<Vec<u8>>,
+    frames: std::sync::mpsc::SyncSender<Frame>,
+    spares: std::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<()> {
+    let frame_bytes = geometry.frame_bytes();
+    let image_len = frame_len(geometry);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut sent = 0u64;
+    let mut bytes = 0u64;
+    let mut render = |pending: &[u8], used: usize| -> Result<Frame> {
+        let mut image = spares.try_recv().unwrap_or_else(|_| vec![0; image_len]);
+        bg_frames.load(&mut image)?;
+        modulate(&mut image, geometry, &pending[..used]);
+        Ok(Frame { image, bits: used })
+    };
+    let mut done = false;
+    while !done {
+        loop {
+            match inbox.recv() {
+                Ok(chunk) => {
+                    pending.extend_from_slice(&chunk);
+                    if pending.len() >= frame_bytes {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    done = true;
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        // Frame bit counts are multiples of eight, so frame boundaries sit
+        // on byte boundaries and no bit-level bookkeeping is needed while
+        // the payload arrives in byte chunks.
+        while pending.len() >= frame_bytes {
+            let frame = render(&pending, frame_bytes)?;
+            pending.drain(..frame_bytes);
+            if frames.send(frame).is_err() {
+                anyhow::bail!("the stealth writer stopped accepting frames");
+            }
+            sent += 1;
+            bytes += frame_bytes as u64;
+            progress.update(sent, bytes);
+        }
+    }
+    // The very last frame may carry fewer bits: missing bits keep the
+    // clamped background, and rogue decoder output is caught by the strict
+    // stream length plus Reed-Solomon parity.
+    if !pending.is_empty() {
+        let used = pending.len();
+        let frame = render(&pending, used)?;
+        let _ = frames.send(frame);
+        sent += 1;
+        bytes += used as u64;
+        progress.update(sent, bytes);
+    }
+    Ok(())
 }
 
 /// Blind stealth decoder: reads raw yuv420p frames from FFmpeg, finds the
