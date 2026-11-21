@@ -217,6 +217,10 @@ fps = 30
       <input type="checkbox" id="stealth_dense">
       <span><b>stealth_dense</b> — double the stealth data rate: sixteen modulation levels (four bits per block pair) instead of four; pair with intensity 40+ for aggressive platforms such as YouTube</span>
     </div>
+    <div class="check">
+      <input type="checkbox" id="stealth_no_audio">
+      <span><b>stealth_no_audio</b> — leave the background's audio out of the output (by default it is muxed in as AAC 192 kbit/s to complete the camouflage)</span>
+    </div>
 
     <h2 style="margin-top:1.6rem">Hardware</h2>
     <div class="row">
@@ -445,6 +449,10 @@ fps = 30
             <input type="checkbox" id="b-stealth-dense" disabled>
             <span><b>--stealth-dense</b> &#8212; 16 levels (4 bits per pair) instead of 4: double the data rate, pair with intensity 40+</span>
           </div>
+          <div class="check">
+            <input type="checkbox" id="b-stealth-no-audio" disabled>
+            <span><b>--stealth-no-audio</b> &#8212; drop the background's audio instead of muxing it as AAC 192 kbit/s (slightly smaller output)</span>
+          </div>
         </div>
       </fieldset>
       <fieldset>
@@ -496,7 +504,7 @@ fps = 30
 <script>
   const FIELDS = ["width", "height", "block_size", "fps", "compress", "crf", "preset",
     "ecc_symbols", "pbkdf2_iterations", "threads", "chroma", "intra", "gpu", "optimise",
-    "stealth_intensity", "stealth_block", "stealth_dense"];
+    "stealth_intensity", "stealth_block", "stealth_dense", "stealth_no_audio"];
 
   const el = (id) => document.getElementById(id);
 
@@ -561,7 +569,7 @@ fps = 30
   // ---- Import ----------------------------------------------------------------
   // Checkboxes are emitted as bare `on` values when checked and omitted when
   // not, and selects encode the defaults as `auto`/`off` vs an empty value.
-  const CHECKBOX_FIELDS = ["chroma", "intra", "stealth_dense"];
+  const CHECKBOX_FIELDS = ["chroma", "intra", "stealth_dense", "stealth_no_audio"];
   const SELECT_ALIASES = {
     gpu: { auto: "", off: "off", amf: "amf", nvenc: "nvenc", qsv: "qsv", vaapi: "vaapi", "video-toolbox": "video-toolbox" },
     optimise: { off: "", smallest: "smallest", fastest: "fastest", balanced: "balanced" },
