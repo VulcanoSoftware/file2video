@@ -88,9 +88,50 @@ fn memory() -> Option<String> {
     }
 }
 
+/// Name fragments of adapters that cannot encode video in practice:
+/// virtual displays, remote-desktop mirrors, vendor fallback drivers, and
+/// hypervisor virtual GPUs. Never matches real hardware acceleration.
+pub(crate) fn is_virtual_gpu(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let markers: &[&str] = if cfg!(windows) {
+        &[
+            "virtual",
+            "indirect",
+            "basic",
+            "parsec",
+            "idd",
+            "remote",
+            "virtualbox",
+            "vmware",
+            "qxl",
+            "hyper-v",
+            "parallels",
+            "qemu",
+            "displaylink",
+            "mirage",
+            "spacedesk",
+        ]
+    } else if cfg!(target_os = "linux") {
+        &[
+            "virtual", "vmware", "qxl", "virtio", "bochs", "cirrus", "red hat", "citrix", "xen",
+            "qemu",
+        ]
+    } else {
+        &["virtual", "vmware", "parallels", "qemu", "displaylink"]
+    };
+    markers.iter().any(|marker| lower.contains(marker))
+}
+
 /// Detected GPUs as reported by the OS, empty when they cannot be listed.
+/// Virtual adapters (mirrored USB displays, remote-desktop mirrors, VM
+/// graphics) are excluded: encoders cannot use them, so listing them would
+/// push calibration and GPU choice onto hardware that never encodes.
 pub fn gpu_names() -> Vec<String> {
-    gpu().unwrap_or_default()
+    gpu()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !is_virtual_gpu(name))
+        .collect()
 }
 
 fn cpu_name() -> Option<String> {
@@ -210,5 +251,40 @@ pub fn print(ffmpeg: &Path) {
     match ffmpeg_summary(ffmpeg) {
         Some(summary) => eprintln!("FFmpeg: {summary}"),
         None => eprintln!("FFmpeg: {} (could not be queried)", ffmpeg.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_adapters_never_count_as_gpus() {
+        // The mirrored USB display plus hypervisor graphics report
+        // themselves as video controllers; none of them can encode video.
+        for virtual_name in ["USB Mobile Monitor Virtual Display", "VMware SVGA 3D"] {
+            assert!(is_virtual_gpu(virtual_name), "{virtual_name}");
+        }
+        if cfg!(windows) {
+            for virtual_name in [
+                "Microsoft Basic Render Driver",
+                "Microsoft Hyper-V Video",
+                "Citrix Indirect Display Adapter",
+            ] {
+                assert!(is_virtual_gpu(virtual_name), "{virtual_name}");
+            }
+        }
+        if cfg!(target_os = "linux") {
+            assert!(is_virtual_gpu("Red Hat Virtio GPU"));
+        }
+        for real_name in [
+            "AMD Radeon (TM) Graphics",
+            "AMD Radeon RX 7600 XT",
+            "NVIDIA GeForce RTX 4060",
+            "Intel(R) Arc(TM) Graphics",
+            "Intel(R) UHD Graphics 770",
+        ] {
+            assert!(!is_virtual_gpu(real_name), "{real_name}");
+        }
     }
 }

@@ -255,6 +255,8 @@ GPU: AMD Radeon 760M (driver 32.0.11021.2)
 FFmpeg: ffmpeg version N-118233-g... | hardware encoders: ["h264_amf", "h264_nvenc", "h264_qsv"]
 ```
 
+Virtual adapters are filtered from this list: mirrored USB displays, remote-desktop mirrors, and hypervisor graphics never appear as "GPU" (and never influence calibration or encoding).
+
 During long runs, progress lines show frames, percentage, throughput in MB/s, elapsed time and ETA:
 
 ```text
@@ -291,11 +293,13 @@ Passwords can only contain Latin-1 characters (for example ASCII and `é`). Othe
 | Linux | VA-API (`/dev/dri/renderD128`), NVENC, Quick Sync | `vaapi`, `nvenc`, `qsv` |
 | macOS | VideoToolbox | `video-toolbox` |
 
-- Hybrid laptops: when a discrete GPU is detected (any NVIDIA card, Intel Arc, or an AMD Radeon RX model), its encoder is tried before the integrated GPU's.
+- Hybrid laptops: the detected GPUs are ranked per backend (discrete before integrated — any NVIDIA card, Intel Arc, or an AMD Radeon RX model beats an iGPU), and the best one is tried first regardless of the platform default order.
+- Virtual GPUs — mirrored USB displays (for example "USB Mobile Monitor Virtual Display"), remote-desktop/indirect adapters, the Microsoft Basic fallback driver, and hypervisor graphics (VMware, QXL, Virtio, Hyper-V) — are ignored: no backend can encode on them, so they never influence the choice and are filtered out of the diagnostics too.
 - With `--optimise`, the measured calibration decides which backend wins on this machine instead of the trial order above; see [Calibration and automatic optimisation](#calibration-and-automatic-optimisation). Some combinations are broken in specific GPU drivers (for example the chroma modes of the AMF encoder on certain Adrenalin driver versions, which fail mid-encode); the benchmark marks those combinations as failed and `--optimise` never selects them.
 - A GPU is never required: without a working hardware encoder, or with `--gpu off`, the video is encoded on the CPU with `libx264`. FFmpeg still needs `libx264` for that fallback path.
 - A specific `--gpu` value forces that backend and fails if it is not available in your FFmpeg build or its trial encode fails.
 - The GPU encoder is used for encoding only; decoding always runs on the CPU.
+- Only real hardware encodes: when several GPUs are visible, the tool always picks the fastest one (discrete over integrated) rather than the first.
 - `--crf` and `--preset` are translated per backend: constant QP on AMF and VA-API, `-cq` on NVENC, ICQ quality on Quick Sync, and a quality setting on VideoToolbox. The presets map to each encoder's speed levels.
 - Verify the result with a round trip (`encode`, then `decode`, then compare hashes), especially when you use non-default `--crf`, `--preset`, `--chroma`, `--intra` or `--compress` settings. Use `benchmark` to check which backend and modes actually work and how fast they are on your machine.
 - Troubleshooting: when every backend fails, each one prints its FFmpeg trial error (for example `AMF_NO_DLL` means the AMD Adrenalin driver is missing or too old). Update the GPU driver and run again; use `--gpu off` to encode on the CPU without diagnostics.
