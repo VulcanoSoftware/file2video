@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 10
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment-retry.outputs.page_url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -38,5 +38,19 @@ jobs:
         with:
           path: docs
 
+      # Fetching the just-uploaded artifact's metadata occasionally races
+      # the artifact API (deploy-pages then reports "Found 0 artifact(s)")
+      # even though the upload succeeded; a pause and a second attempt
+      # keeps the deploy green without a manual re-run.
       - id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        continue-on-error: true
+
+      - name: Wait out the artifact API race
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 30
+
+      - id: deployment-retry
+        name: Deploy the config generator (retry)
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        if: steps.deployment.outcome == 'failure'
