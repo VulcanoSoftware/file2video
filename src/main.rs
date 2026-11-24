@@ -245,12 +245,16 @@ impl Encoding {
     }
 
     fn resolve(&self, config: &Config) -> Result<(video::Settings, usize, u32)> {
+        // Compact mode draws the transport header into the cell video, which
+        // is at least 256x256 pixels, so only the display grid's own layout
+        // needs to be valid here; demanding room for the header on the
+        // display grid wrongly rejected small resolutions (e.g. 320x240).
         let display = Grid {
             width: self.width.or(config.width).unwrap_or(1920),
             height: self.height.or(config.height).unwrap_or(1080),
             block: self.block_size.or(config.block_size).unwrap_or(8),
         }
-        .validate()?;
+        .validate_layout()?;
         // Compact mode stores one cell per video pixel at cell resolution;
         // the padded cells carry stream data just like any other cell.
         let (crf, preset, parity) = match self.compress.or(config.compress) {
@@ -264,6 +268,10 @@ impl Encoding {
             height: video_dimension(display.height / display.block),
             block: 1,
         };
+        ensure!(
+            grid.bits() >= TRANSPORT_SIZE * 8,
+            "the cell video is too small for the video header"
+        );
         Ok((
             video::Settings {
                 grid,

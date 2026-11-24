@@ -1,6 +1,6 @@
 # file2video
 
-Command-line tool that turns any file into an encrypted H.264 MP4 video and restores it byte for byte. Encryption is the default and can be turned off with `--no-password`.
+command-line tool that turns any file into an encrypted H.264 MP4 video and restores it byte for byte. Encryption is the default and can be turned off with `--no-password`.
 
 **How it works:** the file (and its name) is encrypted with AES-256-GCM (optional with `--no-password`), protected with Reed-Solomon error correction, drawn as cells with 16 brightness levels on video frames (optionally also in the color planes), and encoded with x264 or a hardware GPU encoder. Decoding reverses the process and publishes the output only after the password and integrity checks pass.
 
